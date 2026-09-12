@@ -1,0 +1,97 @@
+name: Release Q1000K chainloader
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to create, for example q1000k-v2026.10-rc1
+        required: true
+        type: string
+      release_title:
+        description: Human-readable release title
+        required: false
+        default: Q1000K HTTP-recovery chainloader
+        type: string
+      prerelease:
+        description: Mark the GitHub release as a pre-release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            bc \
+            bison \
+            build-essential \
+            flex \
+            gcc-aarch64-linux-gnu \
+            libssl-dev \
+            python3 \
+            python3-setuptools \
+            swig \
+            uuid-dev \
+            zlib1g-dev
+
+      - name: Build and verify the Q1000K FIT
+        run: |
+          mkdir -p dist
+          CROSS_COMPILE=aarch64-linux-gnu- JOBS="$(nproc)" \
+            ./scripts/build-chainloader-fit.sh dist/q1000k-chainload-uboot.itb
+          sha256sum dist/q1000k-chainload-uboot.itb | tee dist/q1000k-chainload-uboot.itb.sha256
+
+      - name: Write release notes
+        run: |
+          {
+            echo "Q1000K bare-FIT second-stage chainloader built from ${GITHUB_SHA}."
+            echo
+            echo 'This is the 1 MiB chainloader image, not a whole-NAND image.'
+            echo 'Validate it from RAM and follow the repository safety guidance before persistent installation.'
+            echo
+            echo '```text'
+            sha256sum dist/q1000k-chainload-uboot.itb
+            stat --format='size: %s bytes' dist/q1000k-chainload-uboot.itb
+            echo '```'
+          } > dist/RELEASE-NOTES.md
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: q1000k-chainloader-${{ github.sha }}
+          path: |
+            dist/q1000k-chainload-uboot.itb
+            dist/q1000k-chainload-uboot.itb.sha256
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_TITLE: ${{ inputs.release_title }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          release_args=(
+            "$RELEASE_TAG"
+            dist/q1000k-chainload-uboot.itb
+            dist/q1000k-chainload-uboot.itb.sha256
+            --title "$RELEASE_TITLE"
+            --notes-file dist/RELEASE-NOTES.md
+            --target "$GITHUB_SHA"
+          )
+          if [[ "$PRERELEASE" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+          gh release create "${release_args[@]}"

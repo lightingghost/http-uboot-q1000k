@@ -127,6 +127,16 @@ exercise FIT validation, write gates, recovery UI routing, and packaging
 checks. They are useful regression coverage, not proof that a particular ONT
 is safe to flash.
 
+## Create a release from GitHub Actions
+
+Open the repository's **Actions** tab, select **Release Q1000K chainloader**,
+choose **Run workflow**, and provide a new release tag such as
+`q1000k-v2026.10-rc1`. The workflow installs the AArch64 toolchain, builds and
+verifies the bare FIT, uploads the image and its SHA-256 file as a workflow
+artifact, then creates a GitHub release containing both files. It defaults to
+a pre-release; uncheck that option only for a release you intend to publish as
+stable.
+
 ## Further documentation
 
 The detailed design, factory-data layout, UBI lifecycle, and recovery safety
