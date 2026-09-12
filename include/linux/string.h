@@ -43,12 +43,8 @@ extern int strcmp(const char *,const char *);
 #ifndef __HAVE_ARCH_STRNCMP
 extern int strncmp(const char *,const char *,__kernel_size_t);
 #endif
-#ifndef __HAVE_ARCH_STRCASECMP
 int strcasecmp(const char *s1, const char *s2);
-#endif
-#ifndef __HAVE_ARCH_STRNCASECMP
-extern int strncasecmp(const char *s1, const char *s2, __kernel_size_t len);
-#endif
+int strncasecmp(const char *s1, const char *s2, __kernel_size_t len);
 #ifndef __HAVE_ARCH_STRCHR
 extern char * strchr(const char *,int);
 #endif
@@ -63,7 +59,7 @@ extern char * strchr(const char *,int);
  * @c: character to search for
  * Return: position of @c in @s, or end of @s if not found
  */
-const char *strchrnul(const char *s, int c);
+char *strchrnul(const char *s, int c);
 
 #ifndef __HAVE_ARCH_STRRCHR
 extern char * strrchr(const char *,int);
@@ -75,6 +71,7 @@ extern char * strstr(const char *,const char *);
 #ifndef __HAVE_ARCH_STRNSTR
 extern char *strnstr(const char *, const char *, size_t);
 #endif
+char *strcasestr(const char *, const char *);
 #ifndef __HAVE_ARCH_STRLEN
 extern __kernel_size_t strlen(const char *);
 #endif
@@ -106,10 +103,6 @@ extern char * strndup(const char *, size_t);
 
 extern const char *strdup_const(const char *s);
 extern void kfree_const(const void *x);
-
-#ifndef __HAVE_ARCH_STRSWAB
-extern char * strswab(const char *);
-#endif
 
 #ifndef __HAVE_ARCH_MEMSET
 extern void * memset(void *,int,__kernel_size_t);

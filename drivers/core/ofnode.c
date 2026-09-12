@@ -130,8 +130,10 @@ int oftree_new(oftree *treep)
 		if (!fdt)
 			return log_msg_ret("fla", -ENOMEM);
 		ret = fdt_create_empty_tree(fdt, size);
-		if (ret)
+		if (ret) {
+			free(fdt);
 			return log_msg_ret("fla", -EINVAL);
+		}
 		oftree_list[oftree_count++] = fdt;
 		tree.fdt = fdt;
 	}

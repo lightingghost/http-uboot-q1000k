@@ -1461,8 +1461,17 @@ int fit_image_verify_with_data(const void *fit, int image_noffset,
 int fit_image_verify(const void *fit, int noffset);
 #if CONFIG_IS_ENABLED(FIT_SIGNATURE)
 int fit_config_verify(const void *fit, int conf_noffset);
+int fit_config_verify_with_key_blob(const void *fit, int conf_noffset,
+				    const void *key_blob);
 #else
 static inline int fit_config_verify(const void *fit, int conf_noffset)
+{
+	return 0;
+}
+
+static inline int fit_config_verify_with_key_blob(const void *fit,
+						  int conf_noffset,
+						  const void *key_blob)
 {
 	return 0;
 }
@@ -1525,6 +1534,10 @@ int fit_check_format(const void *fit, ulong size);
  * Configuration 1 would be picked because the first string in U-Boot's
  * compatible list, "foo,bar", matches a compatible string in the root of fdt1.
  * "bim,bam" in fdt2 matches the second string which isn't as good as fdt1.
+ *
+ * If several configurations match at the same position, the one named by the
+ * 'default' property of the configurations node is preferred, then the first
+ * one listed.
  *
  * As an optimization, the compatible property from the FDT's root node can be
  * copied into the configuration node in the FIT image. This is required to

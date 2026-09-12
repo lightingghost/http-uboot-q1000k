@@ -263,12 +263,12 @@ char * strchr(const char * s, int c)
 }
 #endif
 
-const char *strchrnul(const char *s, int c)
+char *strchrnul(const char *s, int c)
 {
 	for (; *s != (char)c; ++s)
 		if (*s == '\0')
 			break;
-	return s;
+	return (char *)s;
 }
 
 #ifndef __HAVE_ARCH_STRRCHR
@@ -399,7 +399,6 @@ void kfree_const(const void *x)
 }
 
 
-#ifndef __HAVE_ARCH_STRSPN
 /**
  * strspn - Calculate the length of the initial substring of @s which only
  *	contain letters in @accept
@@ -424,9 +423,7 @@ size_t strspn(const char *s, const char *accept)
 
 	return count;
 }
-#endif
 
-#ifndef __HAVE_ARCH_STRPBRK
 /**
  * strpbrk - Find the first occurrence of a set of characters
  * @cs: The string to be searched
@@ -444,9 +441,7 @@ char * strpbrk(const char * cs,const char * ct)
 	}
 	return NULL;
 }
-#endif
 
-#ifndef __HAVE_ARCH_STRTOK
 /**
  * strtok - Split a string into tokens
  * @s: The string to be searched
@@ -473,9 +468,7 @@ char * strtok(char * s,const char * ct)
 	___strtok = send;
 	return (sbegin);
 }
-#endif
 
-#ifndef __HAVE_ARCH_STRSEP
 /**
  * strsep - Split a string into tokens
  * @s: The string to be searched
@@ -501,35 +494,6 @@ char * strsep(char **s, const char *ct)
 
 	return sbegin;
 }
-#endif
-
-#ifndef __HAVE_ARCH_STRSWAB
-/**
- * strswab - swap adjacent even and odd bytes in %NUL-terminated string
- * s: address of the string
- *
- * returns the address of the swapped string or NULL on error. If
- * string length is odd, last byte is untouched.
- */
-char *strswab(const char *s)
-{
-	char *p, *q;
-
-	if ((NULL == s) || ('\0' == *s)) {
-		return (NULL);
-	}
-
-	for (p=(char *)s, q=p+1; (*p != '\0') && (*q != '\0'); p+=2, q+=2) {
-		char  tmp;
-
-		tmp = *p;
-		*p  = *q;
-		*q  = tmp;
-	}
-
-	return (char *) s;
-}
-#endif
 
 #ifndef __HAVE_ARCH_MEMSET
 /**
@@ -702,7 +666,7 @@ void *memdup(const void *src, size_t len)
  *
  * @s1:		string to be searched
  * @s2:		string to search for
- * @len:	maximum number of characters in s2 to consider
+ * @len:	maximum number of characters in s1 to consider
  *
  * Return:	pointer to the first occurrence or NULL
  */
@@ -728,7 +692,6 @@ char *strnstr(const char *s1, const char *s2, size_t len)
  *
  * @s1:		string to be searched
  * @s2:		string to search for
- * @len:	maximum number of characters in s2 to consider
  *
  * Return:	pointer to the first occurrence or NULL
  */
@@ -737,6 +700,33 @@ char *strstr(const char *s1, const char *s2)
 	return strnstr(s1, s2, SIZE_MAX);
 }
 #endif
+
+/**
+ * strcasestr() - Case insensitive substring search
+ *
+ * @haystack:	string to be searched
+ * @needle:	string to search for
+ *
+ * Return:	pointer to the first occurrence or NULL
+ *
+ * The case of both strings are ignored.
+ */
+char *strcasestr(const char *haystack, const char *needle)
+{
+	size_t l1, l2;
+
+	l1 = strlen(haystack);
+	l2 = strlen(needle);
+
+	while (l1 >= l2) {
+		if (!strncasecmp(haystack, needle, l2))
+			return (char *)haystack;
+		haystack++;
+		l1--;
+	}
+
+	return NULL;
+}
 
 #ifndef __HAVE_ARCH_MEMCHR
 /**

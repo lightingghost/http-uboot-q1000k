@@ -101,6 +101,7 @@ static const struct mtk_clk_tree mt8195_apmixedsys_clk_tree = {
 	.num_ext_clks = ARRAY_SIZE(ext_clock_rates),
 	.plls = apmixed_plls,
 	.num_plls = ARRAY_SIZE(apmixed_plls),
+	.type = MTK_CLK_TREE_APMIXED,
 };
 
 #define FIXED_CLK0(_id, _rate)	\
@@ -1423,6 +1424,7 @@ static const struct mtk_clk_tree mt8195_topckgen_clk_tree = {
 	.num_fdivs = ARRAY_SIZE(top_fixed_divs),
 	.num_muxes = ARRAY_SIZE(top_muxes),
 	.num_gates = ARRAY_SIZE(top_cg_clks),
+	.type = MTK_CLK_TREE_TOPCKGEN,
 };
 
 static const struct mtk_gate_regs infra_ao0_cg_regs = {
@@ -1631,27 +1633,29 @@ static const struct udevice_id of_match_clk_mt8195_infra_ao[] = {
 	{ }
 };
 
-U_BOOT_DRIVER(mtk_clk_apmixedsys) = {
+U_BOOT_DRIVER(mt8195_clk_apmixedsys) = {
 	.name = "mt8195-apmixedsys",
 	.id = UCLASS_CLK,
 	.of_match = mt8195_apmixed,
+	.bind = mtk_common_clk_parent_bind,
 	.probe = mt8195_apmixedsys_probe,
 	.priv_auto = sizeof(struct mtk_clk_priv),
 	.ops = &mtk_clk_apmixedsys_ops,
 	.flags = DM_FLAG_PRE_RELOC,
 };
 
-U_BOOT_DRIVER(mtk_clk_topckgen) = {
+U_BOOT_DRIVER(mt8195_clk_topckgen) = {
 	.name = "mt8195-topckgen",
 	.id = UCLASS_CLK,
 	.of_match = mt8195_topckgen_compat,
+	.bind = mtk_common_clk_parent_bind,
 	.probe = mt8195_topckgen_probe,
 	.priv_auto = sizeof(struct mtk_clk_priv),
 	.ops = &mtk_clk_topckgen_ops,
 	.flags = DM_FLAG_PRE_RELOC,
 };
 
-U_BOOT_DRIVER(mtk_clk_infra_ao) = {
+U_BOOT_DRIVER(mt8195_clk_infra_ao) = {
 	.name = "mt8195-infra_ao",
 	.id = UCLASS_CLK,
 	.of_match = of_match_clk_mt8195_infra_ao,

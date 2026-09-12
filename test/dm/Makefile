@@ -95,6 +95,7 @@ obj-$(CONFIG_PINCONF) += pinmux.o
 endif
 obj-$(CONFIG_POWER_DOMAIN) += power-domain.o
 obj-$(CONFIG_ACPI_PMC) += pmc.o
+obj-$(CONFIG_CMD_PMBUS) += pmbus.o
 obj-$(CONFIG_DM_PMIC) += pmic.o
 obj-$(CONFIG_DM_PWM) += pwm.o
 obj-$(CONFIG_ARM_FFA_TRANSPORT) += ffa.o

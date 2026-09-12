@@ -448,7 +448,7 @@ int bloblist_new(ulong addr, uint size, uint flags, uint align_log2)
 	hdr->align_log2 = align_log2 ? align_log2 : BLOBLIST_BLOB_ALIGN_LOG2;
 	hdr->chksum = 0;
 	gd->bloblist = hdr;
-	gd->flags |= GD_FLG_BLOBLIST_READY;
+	gd->flags |= GD_FLG_BLOBLIST_HANDOFF;
 
 	return 0;
 }
@@ -476,7 +476,7 @@ int bloblist_check(ulong addr, uint size)
 		return log_msg_ret("Bad checksum", -EIO);
 	}
 	gd->bloblist = hdr;
-	gd->flags |= GD_FLG_BLOBLIST_READY;
+	gd->flags |= GD_FLG_BLOBLIST_HANDOFF;
 
 	return 0;
 }
@@ -627,7 +627,7 @@ int bloblist_init(void)
 	int ret;
 	ulong addr = 0, size = CONFIG_BLOBLIST_SIZE;
 
-	if (gd->flags & GD_FLG_BLOBLIST_READY) {
+	if (gd->flags & GD_FLG_BLOBLIST_HANDOFF) {
 		log_debug("Found existing bloblist size %x at %p\n",
 			  gd->bloblist->total_size, gd->bloblist);
 		return 0;
@@ -689,7 +689,7 @@ int bloblist_check_reg_conv(ulong rfdt, ulong rzero, ulong rsig, ulong xlist)
 	if (rfdt != (ulong)bloblist_find(BLOBLISTT_CONTROL_FDT, 0)) {
 		/* Remove this bloblist from gd */
 		gd->bloblist = NULL;
-		gd->flags &= ~GD_FLG_BLOBLIST_READY;
+		gd->flags &= ~GD_FLG_BLOBLIST_HANDOFF;
 		return -EIO;
 	}
 

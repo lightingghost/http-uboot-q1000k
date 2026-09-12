@@ -1,0 +1,123 @@
+.. SPDX-License-Identifier: GPL-2.0+
+
+Axon Networks XG2010G
+*********************
+
+The XG2010G is an optical network terminal based on the Airoha AN7581. This
+port is derived from the stock 512 MiB SPI-NAND image and keeps the vendor
+flash boundaries intact.
+
+Building
+--------
+
+Build the second-stage U-Boot image with an AArch64 cross compiler::
+
+   make xg2010g_defconfig
+   make CROSS_COMPILE=aarch64-linux-gnu-
+
+``u-boot.bin`` and ``u-boot.img`` are build inputs, not directly flashable
+XG2010G images. The chainloader FIT is the image read by the stock boot command
+from the chainloader partition and must start at logical offset ``0``.
+
+Flash layout
+------------
+
+The primary layout follows the XR1710G UBI design while retaining the XG2010G
+factory-data boundaries:
+
+============ ========== ==========
+Partition    Offset     Size
+============ ========== ==========
+vendor       0x00000000 6 MiB
+chainloader  0x00600000 1 MiB
+ubi          0x00700000 438 MiB
+art          0x1bd00000 3 MiB
+reserved_bmt 0x1c000000 64 MiB
+============ ========== ==========
+
+``vendor`` contains the stock bootloader, environment and DSD areas. The
+``ubi`` partition ends at ``0x1bd00000``, one MiB earlier than the XR1710G 2.0
+layout, because XG2010G stores ART data there. Copying the XR1710G end address
+would overwrite part of ART.
+
+The original ``bootloader``, ``uenv``, ``dsd``, ``tclinux``,
+``tclinux_slave``, ``system``, ``rootfs_data_stock`` and ``reserved_stock``
+regions remain available as overlapping read-only compatibility views. They
+allow factory-data access and stock boot fallback before UBI is initialized.
+Only the primary ``ubi`` view is writable as firmware storage. ART and the
+final BMT/BBT area are always read-only.
+
+Boot and recovery
+-----------------
+
+The default boot path reads the ``fit`` volume from ``ubi`` and uses the same
+``config-1`` convention as XR1710G. If UBI is not formatted or does not contain
+a bootable image, U-Boot falls back to the stock ``tclinux_slave`` view. The
+chainloader path reads the FIT header at logical offset ``0`` and loads only
+the FIT's declared total size.
+
+Holding reset (GPIO 0, active low) during U-Boot startup enters HTTP recovery
+at ``http://192.168.255.1``. Firmware recovery accepts an OpenWrt FIT image,
+recreates the fixed 438 MiB UBI layout, writes the image to ``ubi:fit`` and
+creates ``rootfs_data`` from the remaining space. The erase range is strictly
+``0x00700000..0x1bd00000``; DSD, ART and BMT/BBT data remain untouched.
+
+The U-Boot upload target is capped at the 1 MiB ``chainloader`` region starting
+at ``0x00600000``. Web recovery accepts a bare FIT or an older packaged slot as
+input, validates the FIT, extracts it when necessary, erases the 1 MiB region,
+and writes the FIT at offset ``0``. Do not upload ``u-boot.bin`` or
+``u-boot.img`` directly.
+
+Factory data and environment
+----------------------------
+
+LAN and WAN MAC addresses are read from the newline-separated key/value data
+at the start of the read-only ``dsd`` compatibility view. Other DSD fields are
+neither imported nor modified.
+
+The stock ``uenv`` area remains read-only. Persistent U-Boot settings use the
+redundant ``ubootenv`` and ``ubootenv2`` UBI volumes, matching XR1710G. Before
+UBI is initialized, environment loading falls back to compiled defaults and
+``saveenv`` cannot overwrite the stock vendor environment.
+
+Ethernet
+--------
+
+U-Boot exposes all four XG2010G copper ports as LAN recovery paths. LAN1 and
+LAN3 share FE ``gdm4`` but retain independent source-port and QDMA-channel
+metadata, LAN2 uses ``gdm3``, and LAN4 continues to use the internal ``gdm1``
+switch path. PON uses ``gdm2`` and is not a copper recovery port:
+
+============ =========================== =========== ============
+Port         Host path                   Source port QDMA channel
+============ =========================== =========== ============
+LAN1 / 10G   Ethernet USXGMII, RTL8261   0x18        13
+LAN2 / 10G   PCIe1 USXGMII, RTL8261      0x17        11 (NBOQ 5)
+LAN3 / 2.5G  USB Multi-SerDes HSGMII     0x19        12
+LAN4 / 1G    Internal switch/ePHY        -           -
+============ =========================== =========== ============
+
+LAN1 uses RTL8261 MDIO address 5 and active-low reset GPIO 29. LAN2 uses the
+second RTL8261 at address 8/GPIO 27. LAN3 uses an Airoha EN8811H at primary
+MDIO address 15 with auxiliary addresses 13 and 14; its active-low reset is
+GPIO 31. The EN8811H MD32 firmware extracted from the stock root filesystem is
+LZMA-compressed and embedded in U-Boot, so PHY initialization does not depend
+on a filesystem.
+
+In the default ``auto`` mode, broadcasts and multicasts are copied to all four
+LAN paths. RX source-port metadata is cached per peer MAC so unicast replies
+return through the same endpoint. Set ``recovery_port`` to ``lan1`` or ``10g``
+for LAN1 only; ``lan2``, ``pcie`` or ``pcie1`` for LAN2 only; ``lan3``,
+``2.5g``, ``2g5``, ``2500`` or ``usb`` for LAN3 only; and ``lan4`` or ``1g``
+for LAN4 only.
+
+Hardware status
+---------------
+
+The partition map, FIT offset, 1 GiB DRAM size, MAC data format, Ethernet and
+USB Multi-SerDes register windows, source ports, QDMA channels and external PHY
+addresses were checked against the stock ``XG2010G_fw_1.0.0.13`` dump and SDK.
+The stock environment selects ``serdes_ethernet=411`` and
+``serdes_usb1=111``. U-Boot build and DTB checks cover all four recovery
+paths, but physical link, packet traffic, reset-button entry and destructive
+recovery still require validation on XG2010G hardware before deployment.

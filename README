@@ -53,17 +53,17 @@ Where to get help:
 
 In case you have questions about, problems with or contributions for
 U-Boot, you should send a message to the U-Boot mailing list at
-<u-boot@lists.denx.de>. There is also an archive of previous traffic
+<u-boot@lists.u-boot-project.org>. There is also an archive of previous traffic
 on the mailing list - please search the archive before asking FAQ's.
-Please see https://lists.denx.de/pipermail/u-boot and
+Please see https://lists.u-boot-project.org/pipermail/u-boot and
 https://marc.info/?l=u-boot
 
 Where to get source code:
 =========================
 
 The U-Boot source code is maintained in the Git repository at
-https://source.denx.de/u-boot/u-boot.git ; you can browse it online at
-https://source.denx.de/u-boot/u-boot
+https://git.u-boot-project.org/u-boot/u-boot.git ; you can browse it online at
+https://git.u-boot-project.org/u-boot/u-boot
 
 The "Tags" links on this page allow you to download tarballs of
 any version you might be interested in. Official releases are also
@@ -409,7 +409,7 @@ The following options need to be configured:
 - USB Device:
 		Define the below if you wish to use the USB console.
 		Once firmware is rebuilt from a serial console issue the
-		command "setenv stdin usbtty; setenv stdout usbtty" and
+		command "env set stdin usbtty; env set stdout usbtty" and
 		attach your USB cable. The Unix command "dmesg" should print
 		it has found a new device. The environment variable usbtty
 		can be set to gserial or cdc_acm to enable your device to
@@ -733,7 +733,7 @@ The following options need to be configured:
 		remaining RAM in a form that can be passed as boot
 		argument to Linux, for instance like that:
 
-			setenv bootargs ... mem=\${mem}
+			env set bootargs ... mem=\${mem}
 			saveenv
 
 		This way you can tell Linux not to use this memory,
@@ -762,7 +762,7 @@ The following options need to be configured:
 		directly type `$name' at the command prompt.
 
 		Global environment variables are those you use
-		setenv/printenv to work with. To run a command stored
+		env set/env print to work with. To run a command stored
 		in such a variable, you need to use the run command,
 		and you must not use the '$' sign to access them.
 
@@ -1663,15 +1663,15 @@ The "bootm" command is used to boot an application that is stored in
 memory (RAM or Flash). In case of a Linux kernel image, the contents
 of the "bootargs" environment variable is passed to the kernel as
 parameters. You can check and modify this variable using the
-"printenv" and "setenv" commands:
+"env print" and "env set" commands:
 
 
-	=> printenv bootargs
+	=> env print bootargs
 	bootargs=root=/dev/ram
 
-	=> setenv bootargs root=/dev/nfs rw nfsroot=10.0.0.2:/LinuxPPC nfsaddrs=10.0.0.99:10.0.0.2
+	=> env set bootargs root=/dev/nfs rw nfsroot=10.0.0.2:/LinuxPPC nfsaddrs=10.0.0.99:10.0.0.2
 
-	=> printenv bootargs
+	=> env print bootargs
 	bootargs=root=/dev/nfs rw nfsroot=10.0.0.2:/LinuxPPC nfsaddrs=10.0.0.99:10.0.0.2
 
 	=> bootm 40020000

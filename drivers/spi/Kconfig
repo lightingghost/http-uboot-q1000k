@@ -70,6 +70,15 @@ config AIROHA_SNFI_SPI
 	  used to access SPI memory devices like SPI-NOR or SPI-NAND on
 	  platforms embedding this IP core, like AN7581.
 
+config AIROHA_SNFI_NAND_WRITE_GUARD
+	bool "Block Airoha SPI-NAND writes until HTTP firmware commit"
+	depends on AIROHA_SNFI_SPI && HTTPD_RECOVERY && ENV_IS_NOWHERE
+	help
+	  Start with NAND program, erase and write-enable commands blocked at
+	  the controller, including OOB/bad-block-marker writes and DMA writes.
+	  The Q1000K HTTP recovery path opens a temporary write window only for
+	  a validated firmware upload after its response is acknowledged.
+
 config ALTERA_SPI
 	bool "Altera SPI driver"
 	help

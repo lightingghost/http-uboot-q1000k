@@ -9,6 +9,7 @@
 #include <spl.h>
 #include <asm/arch/k3-ddr.h>
 #include <fdt_support.h>
+#include <image.h>
 
 #include "phycore-ddr-data.h"
 #include "../common/k3/k3_ddrss_patch.h"
@@ -237,3 +238,8 @@ void spl_board_init(void)
 	       MCU_CTRL_DEVICE_CLKOUT_32K_CTRL);
 }
 #endif
+
+int board_fit_config_name_match(const char *name)
+{
+	return k3_fit_config_match_security_state(name);
+}

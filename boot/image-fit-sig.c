@@ -708,8 +708,14 @@ static int fit_config_verify_required_keys(const void *fit, int conf_noffset,
 	return 0;
 }
 
+int fit_config_verify_with_key_blob(const void *fit, int conf_noffset,
+				    const void *key_blob)
+{
+	return fit_config_verify_required_keys(fit, conf_noffset, key_blob);
+}
+
 int fit_config_verify(const void *fit, int conf_noffset)
 {
-	return fit_config_verify_required_keys(fit, conf_noffset,
+	return fit_config_verify_with_key_blob(fit, conf_noffset,
 					       gd_fdt_blob());
 }

@@ -1,0 +1,346 @@
+.. SPDX-License-Identifier: GPL-2.0+
+
+Quantum Fiber Q1000K
+********************
+
+The Q1000K is an Airoha AN7581 optical network terminal with 512 MiB DRAM and a
+512 MiB SPI-NAND. This port is a second-stage U-Boot chainloader: the stock
+vendor first stage remains in place and loads the chainloader from the 1 MiB
+window at logical offset ``0x00600000``.
+
+Building
+--------
+
+From this checkout, build and package the chainloader with an AArch64 cross
+compiler::
+
+   CROSS_COMPILE=aarch64-linux-gnu- JOBS=8 ./scripts/build-chainloader-fit.sh
+
+For an OpenWrt toolchain, set ``CROSS_COMPILE`` to its full compiler prefix
+and ``STAGING_DIR`` to the OpenWrt staging directory, for example::
+
+   export STAGING_DIR=/path/to/openwrt/staging_dir
+   export CROSS_COMPILE="$STAGING_DIR/toolchain-aarch64_cortex-a53_gcc-14.4.0_musl/bin/aarch64-openwrt-linux-musl-"
+   JOBS=8 ./scripts/build-chainloader-fit.sh
+
+The script applies ``q1000k_defconfig``, builds in the source directory and
+creates ``q1000k-chainload-uboot.itb`` there. An optional output path is
+relative to the caller's working directory. To package an existing build
+without rebuilding or resetting its configuration::
+
+   ./scripts/build-chainloader-fit.sh --package-only /tmp/q1000k-test.itb
+
+Packaging checks the board, load address and NAND-protection configuration,
+enforces the 1 MiB FIT limit, extracts and compares both payloads, and prints
+the final SHA-256. A failed packaging check leaves an existing output file
+intact. No OpenWrt packaging helper, stock NAND dump or shim is required.
+
+Packaging the vendor-bootable chainloader FIT
+----------------------------------------------
+
+``board/airoha/an7581/q1000k-chainloader.its`` describes the same two-image
+boot arrangement previously generated with OpenWrt's ``mkits.sh``:
+
+* ``kernel-1`` contains the raw ``u-boot.bin``, with ``type = "kernel"``,
+  ``os = "linux"``, AArch64 architecture and no compression. The vendor
+  Linux ``bootm`` path loads and enters it at ``0x81e00000``.
+* ``fdt-1`` contains the matching Q1000K U-Boot device tree, with load address
+  ``0x82000000``.
+
+Both images carry CRC32 and SHA-1 hashes. ``conf-uboot`` references them and
+is the default configuration. The FIT starts at file offset zero and fits
+within the 1 MiB chainloader window. ``u-boot.img`` is a legacy U-Boot wrapper
+and must not be substituted for the raw payload.
+
+The ``master`` README's ``build-chainloader-fit.sh`` example describes a
+different, shim-based XR1710G package. It requires external shim/control-DTB
+inputs and an ITS template; the example is not a complete build script in
+the repository. Its additional slot file places a legacy prefix at offset
+zero and the FIT at ``0x2100``. The Q1000K script produces the bare FIT used
+by the tested RAM boot, without that prefix.
+
+The ``xg2010g`` branch's verified FIT has three images: ``fdt@1`` is a small
+control DTB, ``kernel@1`` is an LZMA-compressed chainloader shim loaded at
+``0x80088000``, and ``uboot@1`` is the separate U-Boot firmware payload loaded
+at ``0x81e00000``. Its three-image check applies to that particular package.
+On Q1000K, the vendor boot log confirms a successful direct handoff to the
+U-Boot payload in ``kernel-1``; a separate shim and third image are not
+required for this tested boot path.
+
+Load the generated FIT into RAM at ``0x89000000`` using the existing transfer
+method, then verify and boot it in the vendor console::
+
+   iminfo 0x89000000
+   bootm 0x89000000
+
+Flash layout
+------------
+
+The port uses one fixed UBI region. Explicit installation preserves the stock
+first stage, DSD, ART and vendor BMT/BBT space, and changes only ``bootcmd``
+in the vendor environment.
+
+============ ========== ==========
+Partition    Offset     Size
+============ ========== ==========
+vendor       0x00000000 6 MiB
+chainloader  0x00600000 1 MiB, read-only
+ubi          0x00700000 438 MiB
+art          0x1bd00000 3 MiB, read-only
+reserved_bmt 0x1c000000 64 MiB, read-only
+============ ========== ==========
+
+The 438 MiB figure is the complete raw UBI partition, from ``0x00700000``
+up to but excluding ``0x1bd00000``. Usable FIT volume capacity is smaller
+because UBI needs overhead and reserved space. The recovery page reports
+this configured target without scanning or attaching the current UBI data.
+
+The chainloader and vendor partitions remain read-only through ordinary MTD
+partition access. The installer uses narrowly bounded raw-device writes after
+checking the live NAND geometry, vendor environment and BBT/BMT tables.
+
+Installation and UBI volumes
+---------------------------
+
+The complete source comparison is in ``q1000k-installer-comparison.md``. The
+Q1000K follows the W1700K volume IDs, types and environment/factory sizes,
+using the Q1000K ART boundary and the user's two-step installation flow.
+
+1. RAM-boot the newly built ``q1000k-chainload-uboot.itb``. Before installation,
+   it opens HTTP recovery at ``http://192.168.255.1``.
+2. Open **Update U-Boot**, set **U-Boot operation** to **Install U-Boot and
+   prepare UBI**, select that same installer-capable FIT, and click
+   **Install U-Boot and Prepare UBI**. Confirm that the existing UBI firmware,
+   recovery image and OpenWrt settings will be erased.
+3. After reboot, upload the Q1000K UBI ``*-sysupgrade.itb`` through **Firmware
+   Recovery**. A separate **Recovery Image** upload accepts a Q1000K UBI
+   ``*-initramfs-recovery.itb``. Both must describe the fixed 438 MiB layout.
+   Upload recovery first if both images are available: each upload resets
+   the OpenWrt overlay when resizing its target volume.
+
+The default **Update U-Boot only (keep UBI)** option replaces and verifies only
+the 1 MiB chainloader slot at ``0x600000``. It validates the uploaded FIT and
+checks NAND geometry, boot-region bad blocks and vendor BBT/BMT mapping before
+writing. It does not attach or format UBI, migrate factory data, or modify the
+vendor environment. All existing UBI volumes and the vendor boot command are
+preserved. First-time installation still requires the explicit installer
+option below. Both operations reboot after successful verification.
+
+Update-only uses ``/upload/uboot-only``; the full installer retains
+``/upload/uboot``. Older servers reject the new endpoint instead of treating
+it as a request to format UBI. The chosen operation is bound to the upload
+and can run only after validation and acknowledgement of its POST response.
+
+**Install U-Boot and Prepare UBI** performs these operations in order:
+
+* Validate the complete two-image Q1000K FIT, all payload hashes, load/entry
+  addresses, the UBI boundary and the ``q1000k,installer-version = <1>`` marker.
+  Old chainloaders without installer/installed-boot support are rejected.
+* Check the live 512 MiB NAND geometry, identity BBT/BMT mapping, CRC-valid
+  16 KiB vendor environment, DSD MAC/serial/FSAN fields and both PON calibration
+  records, without writes.
+* Erase the 1 MiB chainloader slot at ``0x600000``, write the FIT at offset
+  zero, and read back every eraseblock. Abort on bad blocks or write errors;
+  never skip blocks, remap the raw slot or change vendor BBT/BMT tables.
+* Format only the 438 MiB UBI partition, preserving valid erase counters and
+  writing fresh EC headers. Write and read back both copies of the empty UBI
+  volume table, with their VID headers, in separate good eraseblocks before
+  attaching UBI. Create the volumes below and write/verify factory.
+* Detach UBI, replace only vendor ``bootcmd`` in a read-modify-write of its
+  first 128 KiB eraseblock at ``0x200000``, recompute its CRC and verify it.
+  The command is ``flash read 0x600000 0x100000 0x89000000; bootm 0x89000000``.
+* Close the NAND write gate and reboot after success. Errors stop the operation
+  and close the gate; the serial console reports the failing stage.
+
+An earlier installer wrote only EC headers and failed during attachment with
+``the layout volume was not found`` / ``-22``. At that point the chainloader
+slot has been written and the UBI partition erased, but the vendor environment
+has not been changed and the DSD/ART sources remain intact. The corrected
+formatter can prepare UBI from this intermediate state. RAM-boot the corrected
+chainloader before retrying installation: uploading a new FIT to an old
+running recovery session still executes that session's old installer code.
+Use the RAM-loading procedure above; do not depend on the erased stock
+firmware for the next boot.
+
+== ============ ======= =====================================================
+ID Volume       Type    Content / requested size
+== ============ ======= =====================================================
+0  ubootenv     dynamic 126,976 bytes (one LEB), initially empty
+1  ubootenv2    dynamic 126,976 bytes (one LEB), initially empty
+2  factory      static  65,536 bytes
+3  recovery     dynamic One empty LEB; resized to the recovery FIT on upload
+4  fit          dynamic One empty LEB; resized to the sysupgrade FIT on upload
+5  rootfs_data  dynamic Remaining available LEBs
+== ============ ======= =====================================================
+
+The 64 KiB factory record is zero-filled, then populated as follows. Offsets
+are within the volume, not absolute NAND addresses.
+
+========== ==================== =============================================
+Offset     Field                Encoding / length
+========== ==================== =============================================
+``0x5000`` WAN MAC              6 bytes
+``0x6000`` LAN MAC              6 bytes
+``0x8000`` Unit serial          NUL-terminated DSD ``serial_number`` (max 127)
+``0x9000`` PON serial / FSAN    12 ASCII bytes followed by NUL
+``0xa000`` GPON calibration     513 bytes from NAND ``0x00411000``
+``0xb000`` XGS-PON calibration  513 bytes from NAND ``0x00412000``
+========== ==================== =============================================
+
+FSAN preserves the DSD ``fsan`` spelling and case; it is distinct from the unit
+serial. Calibration is copied byte for byte using the OEM ``dualbob_7572``
+record length (``0x201``). Padding outside these records stays zero. Missing,
+duplicate, wrong-length or non-printable FSAN, short/failed NAND reads and
+all-zero/all-``0xff`` calibration cause preflight to fail before any writes.
+There is no verified calibration checksum decoder; nonblank data is preserved
+without interpreting its internal fields.
+
+Q1000K has no Wi-Fi or fan, so the reference EEPROM and fan fields remain zero.
+Original DSD and ART stay intact. These copies are made by Update U-Boot's
+explicit installation; ordinary boot and firmware/recovery uploads preserve
+the factory volume. An older installation gains these fields only by rerunning
+the installer, which erases UBI firmware/settings as described above.
+An empty recovery volume is a placeholder, not an installed recovery Linux.
+
+Firmware Recovery replaces only ``fit`` and ``rootfs_data``, preserving
+``ubootenv``, ``ubootenv2``, ``factory`` and ``recovery``. Recovery Image
+replaces ``recovery`` and ``rootfs_data`` while preserving the other volumes.
+Interrupted target uploads can be retried even if the target or overlay is
+missing or the target's update marker is set. An unrelated/unsupported UBI
+layout is rejected; ordinary firmware uploads do not format the whole partition.
+
+The supported vendor environment and mapping format was verified against the
+user's backup: one 16 KiB CRC32 record, an empty 250-entry v1 BBT at
+``0x1e0c0000`` and an empty 250-entry v1 BMT at ``0x1ffe0000``. Additional or
+relocated tables, nonempty mappings, bad raw boot blocks or additional
+CRC-valid environment records cause preflight to refuse installation.
+The single-copy vendor environment cannot be replaced atomically against
+power loss. Bootcmd is written last, but a power interruption during its
+replacement can require vendor-console recovery. Earlier failures also leave
+any already-written chainloader/UBI data in place; there is no rollback.
+
+Boot and HTTP recovery
+----------------------
+
+Before installation selects the chainloader's vendor bootcmd, startup falls
+back to HTTP without attaching UBI. After installation, ``q1000k_boot``
+attaches UBI read-only and tries ``fit``, then ``recovery``; missing or invalid
+images fall back to HTTP. Hold Reset while the chainloader starts to force
+HTTP recovery, or interrupt autoboot and run ``http_recovery`` at the prompt.
+A kernel which successfully starts but later hangs cannot trigger this fallback.
+
+The chainloader environment lives only in RAM. Reserved ``ubootenv`` and
+``ubootenv2`` volumes match the reference layout but are not automatically
+loaded or saved. This avoids writable UBI attachment for settings at startup.
+
+``CONFIG_AIROHA_SNFI_NAND_WRITE_GUARD`` blocks NAND write-enable, program-load,
+program-execute and erase commands at the controller from startup, including
+DMA programming and OOB/bad-block-marker writes. Reads, ECC configuration and
+other required volatile setup remain available. The gate is independent of
+partition read-only flags and environment variables. Installed boot clears
+MTD write permission during UBI attachment so UBI selects its read-only mode;
+the controller gate remains closed throughout reads and fallback.
+
+Only a complete, validated explicit upload and the same connection's successful
+POST-response acknowledgement can open a synchronous write window. The image
+is validated again and read-only preflight finishes before opening that window.
+The gate closes on success and failure. Empty, interrupted, invalid or
+unacknowledged uploads never enable writes. Self-install without an uploaded
+FIT remains disabled on Q1000K. Browsing and target sizing never attach UBI.
+
+The default ``recovery_port=1g`` selects the internal switch/GDM1 route,
+verified on hardware with HTTP recovery. The observed ARP requests arrived
+with source port ``0x11`` (GDM1); forcing replies through ``gdm4`` prevented
+the PC from reaching the server.
+
+The device tree also configures the Q1000K RTL8261 at external MDIO address 8,
+reset GPIO 27, on Ethernet SerDes ``gdm4``. This differs from XG2010G, where
+PHY8 is connected to the PCIe SerDes ``gdm3``. Ethernet initialization skips
+the absent ``gdm3`` PCS; requiring it would abort the entire probe with
+``-ENODEV`` and report ``No ethernet found`` before HTTP recovery starts.
+
+The Q1000K PHY keeps the SerDes setup from the RTL8261 patch table; the
+XR1710G-specific SDS register override is not applied. Indirect SDS reads
+wait for completion before consuming data, including read-modify-write
+operations while loading the PHY patch.
+
+If the page is unreachable, press ``d`` on the serial console while HTTP
+recovery is running to print live PHY, PCS and packet counters. This keeps
+Ethernet running and does not write NAND. In contrast, Ctrl-C stops DMA and
+powers down the PHY, so ``rtl8261_diag`` at the prompt shows shutdown state.
+
+HTTP recovery stages its upload in RAM before writing UBI. On the 512 MiB
+Q1000K it accepts firmware FITs up to 256 MiB in a fixed buffer at ``0x84000000``.
+The buffer must end below U-Boot's reserved runtime memory and a 1 MiB stack
+margin. Environment overrides cannot move it over the running chainloader.
+
+Choose **NAND Backup** in the Q1000K sidebar for the read-only
+**Download NAND Backup** action. Backup controls are on this dedicated page;
+the U-Boot, recovery-image and sysupgrade pages contain only their upload flow.
+It streams the complete 512 MiB ``spi-nand0`` data area to
+``q1000k-nand-backup.bin`` in 256 KiB reads, including the factory, chainloader,
+UBI, ART and reserved BMT/BBT regions. The image contains NAND data bytes as
+reported by U-Boot MTD; it does not include per-page OOB bytes. A recovery
+upload and a NAND backup cannot run at the same time.
+
+Opening the page, polling status and downloading the backup keep the NAND
+write gate closed. NAND data reads do not perform UBI repair, scrubbing or
+on-flash BBT updates. The backup therefore captures the data area before any
+firmware recovery modifies it. Uncorrectable read errors stop the download;
+they are not repaired by writing NAND.
+
+Host regression tests
+---------------------
+
+After building the host ``mkimage`` and ``dtc`` tools, run::
+
+   python3 test/q1000k/test_nand_safety.py
+   python3 test/q1000k/test_chainloader_fit.py
+   python3 test/q1000k/test_installer.py
+   node test/q1000k/test_installer_ui.js
+
+The packaging tests use real host FIT tools to check the two-image boot
+configuration, extracted data and hashes, paths containing spaces, rejection
+of incompatible configurations, and the size limit. Failed packaging must
+preserve an existing output artifact.
+
+Installer tests execute the production environment/factory migration, raw
+writer, UBI formatter and volume-update logic against a host NAND/UBI model.
+They check operation boundaries, update-only preservation of populated UBI
+and the vendor environment, read-back failures, fixed volume IDs and
+sizes, exact FSAN/GPON/XGS-PON copies, rejection of incomplete PON sources,
+preservation and retries. FIT tests reject swapped image roles and
+incompatible partition boundaries. The formatter model uses U-Boot's actual
+EC/VID header validators and volume-table reader to reproduce the missing
+layout error, validate both generated copies and exercise reformatting from
+the EC-only state. This is not a complete UBI or flash-driver simulation.
+To additionally check a local backup
+without modifying it, set ``Q1000K_TEST_BACKUP=/path/to/backup.bin`` when running
+``test_installer.py``. Test fixtures contain no device identifiers.
+
+The tests need a host C compiler and OpenSSL/zlib development libraries. They
+execute the production gate, upload callbacks and backup reader with mocked
+hardware, including a complete 512 MiB stream, failed uploads, unrelated
+connection callbacks and failed flash commits. FIT tests use real libfdt and
+hash verification with inline/external image data, corrupt/truncated payloads
+and a different board's device tree. These tests do not access physical NAND.
+The Ethernet initialization test executes the production initialization
+sequence with mocked hardware: Q1000K must reach FE/QDMA setup without GDM3,
+while populated GDM3 and other hardware failures must still propagate.
+The PHY test models delayed indirect reads, runs the actual SerDes patch
+entries and checks read errors, timeouts and the Q1000K override policy.
+
+Factory data and status
+-----------------------
+
+LAN and WAN MAC addresses are imported from the read-only stock ``dsd``
+partition when its key/value data is valid. The status LEDs use GPIO 17
+(green), 19 (blue), 29 (red) and 20 (white); recovery link LEDs use GPIO 33
+(green) and 43 (yellow).
+
+RAM chainloading and HTTP recovery over the 1g port have been confirmed on the
+user's Q1000K. The first hardware installation reached the UBI attachment
+failure described above. The corrected formatter builds and passes host tests,
+including read-only analysis of the NAND backup. Successful installation with
+this fix, installed boot and firmware/recovery volume updates still require
+hardware verification.

@@ -63,4 +63,12 @@ config DM_THERMAL_JC42
 	  Enable support for the JEDEC JC-42.4 temperature sensor found
 	  on the SPD bus of DDR3 and DDR4 DIMMs (TSE2004av and compatible).
 
+config PMBUS_THERMAL
+	bool "Generic PMBus temperature"
+	depends on DM_REGULATOR_PMBUS_HELPER
+	help
+	  Expose the die-temperature reading of any PMBus voltage
+	  regulator bound by a pmbus_helper based chip driver
+	  as a UCLASS_THERMAL device.
+
 endif # if DM_THERMAL

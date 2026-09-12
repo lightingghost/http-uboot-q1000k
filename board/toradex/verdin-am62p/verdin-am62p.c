@@ -14,6 +14,7 @@
 #include <dm/uclass.h>
 #include <env.h>
 #include <fdt_support.h>
+#include <image.h>
 #include <init.h>
 #include <k3-ddrss.h>
 #include <spl.h>
@@ -83,12 +84,10 @@ int dram_init_banksize(void)
 	return ret;
 }
 
-#if IS_ENABLED(CONFIG_SPL_LOAD_FIT)
 int board_fit_config_name_match(const char *name)
 {
-	return 0;
+	return k3_fit_config_match_security_state(name);
 }
-#endif
 
 #if IS_ENABLED(CONFIG_OF_LIBFDT) && IS_ENABLED(CONFIG_OF_BOARD_SETUP)
 int ft_board_setup(void *blob, struct bd_info *bd)

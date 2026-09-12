@@ -2723,6 +2723,20 @@ config CMD_PMIC
 	  - pmic write address - write byte to register at address
 	  The only one change for this command is 'dev' subcommand.
 
+config CMD_PMBUS
+	bool "pmbus device interrogation and control command"
+	depends on PMBUS
+	help
+	  Enable the pmbus U-Boot CLI command. Provides identification,
+	  decoded telemetry, STATUS_* decoding, raw register read/write,
+	  CLEAR_FAULTS, and VOUT_COMMAND set/get against any PMBus 1.x
+	  compliant device selectable via 'pmbus dev <bus>:<addr>'.
+
+	  Per chip drivers and board files publish vendor extensions in
+	  the 'pmbus <vendor> ...' namespace.
+
+	  See doc/develop/pmbus.rst for the full usage reference.
+
 config CMD_REGULATOR
 	bool "Enable Driver Model REGULATOR command"
 	depends on DM_REGULATOR

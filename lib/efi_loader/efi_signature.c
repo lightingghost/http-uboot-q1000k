@@ -703,8 +703,7 @@ efi_sigstore_parse_siglist(struct efi_signature_list *esl)
 			goto err;
 		}
 
-		sig_data = calloc(esl->signature_size
-					- sizeof(esd->signature_owner), 1);
+		sig_data = calloc(1, sizeof(*sig_data));
 		if (!sig_data) {
 			EFI_PRINT("Out of memory\n");
 			goto err;

@@ -898,8 +898,6 @@ err:
 static int fit_import_data(struct image_tool_params *params, const char *fname)
 {
 	void *fdt, *old_fdt;
-	void *data = NULL;
-	const char *ext_data_prop = NULL;
 	int fit_size, new_size, size, data_base;
 	int fd;
 	struct stat sbuf;
@@ -941,6 +939,8 @@ static int fit_import_data(struct image_tool_params *params, const char *fname)
 	for (node = fdt_first_subnode(fdt, images);
 	     node >= 0;
 	     node = fdt_next_subnode(fdt, node)) {
+		const char *ext_data_prop = NULL;
+		void *data = NULL;
 		int buf_ptr;
 		int len;
 

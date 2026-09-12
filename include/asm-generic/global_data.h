@@ -697,9 +697,9 @@ enum gd_flags {
 	 */
 	GD_FLG_DM_DEAD = 0x400000,
 	/**
-	 * @GD_FLG_BLOBLIST_READY: bloblist is ready for use
+	 * @GD_FLG_BLOBLIST_HANDOFF: bloblist has been found.
 	 */
-	GD_FLG_BLOBLIST_READY = 0x800000,
+	GD_FLG_BLOBLIST_HANDOFF = 0x800000,
 	/**
 	 * @GD_FLG_HUSH_OLD_PARSER: Use hush old parser.
 	 */

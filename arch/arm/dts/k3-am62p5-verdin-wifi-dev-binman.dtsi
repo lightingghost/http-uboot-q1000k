@@ -252,13 +252,18 @@
 			};
 
 			configurations {
-				default = "conf-0";
+				default = "conf-hs-fs";
 
-				conf-0 {
-					description = "k3-am62p5-verdin-wifi-dev";
+				conf-hs-fs {
+					description = "k3-am62p5-verdin-wifi-dev-hs-fs";
 					firmware = "atf";
-					loadables = "tee", "tifsstub-hs", "tifsstub-fs",
-						    "dm", "spl";
+					loadables = "tee", "tifsstub-fs", "dm", "spl";
+					fdt = "fdt-0";
+				};
+				conf-hs-se {
+					description = "k3-am62p5-verdin-wifi-dev-hs-se";
+					firmware = "atf";
+					loadables = "tee", "tifsstub-hs", "dm", "spl";
 					fdt = "fdt-0";
 				};
 			};

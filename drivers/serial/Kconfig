@@ -276,6 +276,14 @@ config DEBUG_UART_ATMEL
 	  will need to provide parameters to make this work. The driver will
 	  be available until the real driver-model serial is running.
 
+config DEBUG_UART_ESP32
+	bool "Espressif ESP32 UART"
+	depends on ESP32_SERIAL
+	help
+	  Select this to enable a debug UART using the ESP32 UART driver. You
+	  will need to provide parameters to make this work. The driver will
+	  be available until the real driver-model serial is running.
+
 config DEBUG_UART_BCM6345
 	bool "BCM6345 UART"
 	depends on BCM6345_SERIAL
@@ -1068,6 +1076,13 @@ config HTIF_CONSOLE
 	  Select this to enable host transfer interface (HTIF) based serial
 	  console. The HTIF device is quite common in RISC-V emulators and
 	  RISC-V ISS so this driver allows using U-Boot on such platforms.
+
+config ESP32_SERIAL
+	bool "Espressif ESP32 UART support"
+	depends on DM_SERIAL
+	help
+	  Select this to enable UART support for Espressif ESP32 family
+	  devices using the U-Boot driver model.
 
 config SIFIVE_SERIAL
 	bool "SiFive UART support"

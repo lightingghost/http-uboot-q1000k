@@ -551,7 +551,7 @@ void sdhci_set_uhs_timing(struct sdhci_host *host)
 
 void sdhci_set_voltage(struct sdhci_host *host)
 {
-	if (IS_ENABLED(CONFIG_MMC_IO_VOLTAGE)) {
+	if (CONFIG_IS_ENABLED(MMC_IO_VOLTAGE)) {
 		struct mmc *mmc = (struct mmc *)host->mmc;
 		u32 ctrl;
 

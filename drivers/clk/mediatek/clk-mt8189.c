@@ -1898,6 +1898,7 @@ static const struct mtk_gate_regs vlpcfg_ao_regs = {
  * arbitrary parent trees.
  */
 #define CLK_PARENT_VLP_CK CLK_PARENT_INFRASYS
+#define MTK_CLK_TREE_VLP_CK MTK_CLK_TREE_INFRASYS
 
 #define GATE_VLPCFG_AO(id, parent, shift, flags) \
 	GATE_FLAGS(id, parent, &vlpcfg_ao_regs, shift, flags | CLK_GATE_NO_SETCLR_INV)
@@ -1915,8 +1916,8 @@ static const struct mtk_gate vlpcfg_ao_clks[] = {
 	GATE_VLPCFG_AO_VLP(CLK_VLPCFG_REG_SCP, CLK_VLP_CK_SCP_SEL, 28),
 	GATE_VLPCFG_AO_EXT(CLK_VLPCFG_REG_RG_R_APXGPT_26M, CLK_PAD_CLK26M, 24),
 	GATE_VLPCFG_AO_EXT(CLK_VLPCFG_REG_DPMSRCK_TEST, CLK_PAD_CLK26M, 23),
-	GATE_VLPCFG_AO_VLP(CLK_VLPCFG_REG_RG_DPMSRRTC_TEST, CLK_PAD_CLK32K, 22),
-	GATE_VLPCFG_AO_VLP(CLK_VLPCFG_REG_DPMSRULP_TEST, CLK_TOP_OSC_D10, 21),
+	GATE_VLPCFG_AO_EXT(CLK_VLPCFG_REG_RG_DPMSRRTC_TEST, CLK_PAD_CLK32K, 22),
+	GATE_VLPCFG_AO_TOP(CLK_VLPCFG_REG_DPMSRULP_TEST, CLK_TOP_OSC_D10, 21),
 	GATE_VLPCFG_AO_VLP(CLK_VLPCFG_REG_SPMI_P_MST, CLK_VLP_CK_SPMI_P_MST_SEL, 20),
 	GATE_VLPCFG_AO_EXT(CLK_VLPCFG_REG_SPMI_P_MST_32K, CLK_PAD_CLK32K, 18),
 	GATE_VLPCFG_AO_VLP(CLK_VLPCFG_REG_PMIF_SPMI_P_SYS, CLK_VLP_CK_PWRAP_ULPOSC_SEL, 13),
@@ -1939,6 +1940,7 @@ static const struct mtk_clk_tree mt8189_apmixedsys_clk_tree = {
 	.num_ext_clks = ARRAY_SIZE(ext_clock_rates),
 	.plls = apmixed_plls,
 	.num_plls = ARRAY_SIZE(apmixed_plls),
+	.type = MTK_CLK_TREE_APMIXED,
 };
 
 static const struct mtk_clk_tree mt8189_topckgen_clk_tree = {
@@ -1953,6 +1955,7 @@ static const struct mtk_clk_tree mt8189_topckgen_clk_tree = {
 	.num_fdivs = ARRAY_SIZE(top_fixed_divs),
 	.num_muxes = ARRAY_SIZE(top_muxes),
 	.num_gates = ARRAY_SIZE(top_gates),
+	.type = MTK_CLK_TREE_TOPCKGEN,
 };
 
 static const struct mtk_clk_tree mt8189_vlpckgen_clk_tree = {
@@ -1964,6 +1967,12 @@ static const struct mtk_clk_tree mt8189_vlpckgen_clk_tree = {
 	.gates = vlp_ck_gates,
 	.num_muxes = ARRAY_SIZE(vlp_ck_muxes),
 	.num_gates = ARRAY_SIZE(vlp_ck_gates),
+	.type = MTK_CLK_TREE_VLP_CK,
+};
+
+static const struct mtk_clk_tree mt8189_clk_tree = {
+	.ext_clk_rates = ext_clock_rates,
+	.num_ext_clks = ARRAY_SIZE(ext_clock_rates),
 };
 
 static const struct udevice_id mt8189_apmixed[] = {
@@ -2022,7 +2031,7 @@ static int mt8189_topckgen_probe(struct udevice *dev)
 
 static int mt8189_infrasys_probe(struct udevice *dev)
 {
-	return mtk_common_clk_infrasys_init(dev, &mt8189_vlpckgen_clk_tree);
+	return mtk_common_clk_init(dev, &mt8189_vlpckgen_clk_tree);
 }
 
 static int mt8189_clk_gate_probe(struct udevice *dev)
@@ -2031,42 +2040,45 @@ static int mt8189_clk_gate_probe(struct udevice *dev)
 
 	data = (void *)dev_get_driver_data(dev);
 
-	return mtk_common_clk_gate_init(dev, &mt8189_topckgen_clk_tree,
+	return mtk_common_clk_gate_init(dev, &mt8189_clk_tree,
 					data->gates, data->num_gates,
 					data->gates[0].id);
 }
 
-U_BOOT_DRIVER(mtk_clk_apmixedsys) = {
+U_BOOT_DRIVER(mt8189_clk_apmixedsys) = {
 	.name = "mt8189-apmixedsys",
 	.id = UCLASS_CLK,
 	.of_match = mt8189_apmixed,
+	.bind = mtk_common_clk_parent_bind,
 	.probe = mt8189_apmixedsys_probe,
 	.priv_auto = sizeof(struct mtk_clk_priv),
 	.ops = &mtk_clk_apmixedsys_ops,
 	.flags = DM_FLAG_PRE_RELOC,
 };
 
-U_BOOT_DRIVER(mtk_clk_topckgen) = {
+U_BOOT_DRIVER(mt8189_clk_topckgen) = {
 	.name = "mt8189-topckgen",
 	.id = UCLASS_CLK,
 	.of_match = mt8189_topckgen_compat,
+	.bind = mtk_common_clk_parent_bind,
 	.probe = mt8189_topckgen_probe,
 	.priv_auto = sizeof(struct mtk_clk_priv),
 	.ops = &mtk_clk_topckgen_ops,
 	.flags = DM_FLAG_PRE_RELOC,
 };
 
-U_BOOT_DRIVER(mtk_clk_vlpckgen) = {
+U_BOOT_DRIVER(mt8189_clk_vlpckgen) = {
 	.name = "mt8189-vlpckgen",
 	.id = UCLASS_CLK,
 	.of_match = mt8189_vlpckgen,
+	.bind = mtk_common_clk_parent_bind,
 	.probe = mt8189_infrasys_probe,
 	.priv_auto = sizeof(struct mtk_clk_priv),
 	.ops = &mtk_clk_infrasys_ops,
 	.flags = DM_FLAG_PRE_RELOC,
 };
 
-U_BOOT_DRIVER(mtk_clk_gate) = {
+U_BOOT_DRIVER(mt8189_clk_gate) = {
 	.name = "mt8189-gate-clk",
 	.id = UCLASS_CLK,
 	.of_match = of_match_mt8189_clk_gate,

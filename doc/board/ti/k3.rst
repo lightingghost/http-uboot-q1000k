@@ -170,7 +170,7 @@ online
 
 * **Das U-Boot**
 
-  | **source:** https://source.denx.de/u-boot/u-boot.git
+  | **source:** https://git.u-boot-project.org/u-boot/u-boot.git
   | **branch:** master
 
 * **Trusted Firmware-A (TF-A)**

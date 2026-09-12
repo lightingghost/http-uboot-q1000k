@@ -1006,7 +1006,7 @@ static u64 set_one_region(u64 start, u64 size, u64 attrs, bool flag, int level)
 
 	/* Can we can just modify the current level block/page? */
 	if (is_aligned(start, size, levelsize)) {
-		if (attrs == PTE_TYPE_FAULT) {
+		if (attrs == PTE_TYPE_FAULT && flag) {
 			if (pte_type(pte) == PTE_TYPE_TABLE && level < 3)
 				*pte = 0;
 			else

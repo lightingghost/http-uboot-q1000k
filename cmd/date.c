@@ -44,7 +44,7 @@ static int do_date(struct cmd_tbl *cmdtp, int flag, int argc,
 		if (strcmp(argv[1],"reset") == 0) {
 			puts ("Reset RTC...\n");
 			rcode = dm_rtc_reset(dev);
-			if (!rcode)
+			if (!rcode || rcode == -ENOSYS)
 				rcode = dm_rtc_set(dev, &default_tm);
 			if (rcode)
 				puts("## Failed to set date after RTC reset\n");

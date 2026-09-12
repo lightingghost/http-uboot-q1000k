@@ -85,7 +85,7 @@ static const struct mtk_gate_regs apmixed_cg_regs = {
 		.parent = _parent,			\
 		.regs = &apmixed_cg_regs,		\
 		.shift = _shift,			\
-		.flags = CLK_GATE_NO_SETCLR_INV,	\
+		.flags = CLK_GATE_NO_SETCLR_INV | CLK_PARENT_APMIXED,	\
 	}
 
 static const struct mtk_gate apmixed_cgs[] = {
@@ -613,6 +613,21 @@ static const struct mtk_clk_tree mt7622_apmixed_clk_tree = {
 	.gates = apmixed_cgs,
 	.num_plls = ARRAY_SIZE(apmixed_plls),
 	.num_gates = ARRAY_SIZE(apmixed_cgs),
+	.type = MTK_CLK_TREE_APMIXED,
+};
+
+static const struct mtk_clk_tree mt7622_topckgen_clk_tree = {
+	.ext_clk_rates = ext_clock_rates,
+	.num_ext_clks = ARRAY_SIZE(ext_clock_rates),
+	.fdivs_offs = CLK_TOP_TO_USB3_SYS,
+	.muxes_offs = CLK_TOP_AXI_SEL,
+	.fclks = top_fixed_clks,
+	.fdivs = top_fixed_divs,
+	.muxes = top_muxes,
+	.num_fclks = ARRAY_SIZE(top_fixed_clks),
+	.num_fdivs = ARRAY_SIZE(top_fixed_divs),
+	.num_muxes = ARRAY_SIZE(top_muxes),
+	.type = MTK_CLK_TREE_TOPCKGEN,
 };
 
 static const struct mtk_clk_tree mt7622_infra_clk_tree = {
@@ -640,14 +655,6 @@ static const struct mtk_clk_tree mt7622_peri_clk_tree = {
 static const struct mtk_clk_tree mt7622_clk_tree = {
 	.ext_clk_rates = ext_clock_rates,
 	.num_ext_clks = ARRAY_SIZE(ext_clock_rates),
-	.fdivs_offs = CLK_TOP_TO_USB3_SYS,
-	.muxes_offs = CLK_TOP_AXI_SEL,
-	.fclks = top_fixed_clks,
-	.fdivs = top_fixed_divs,
-	.muxes = top_muxes,
-	.num_fclks = ARRAY_SIZE(top_fixed_clks),
-	.num_fdivs = ARRAY_SIZE(top_fixed_divs),
-	.num_muxes = ARRAY_SIZE(top_muxes),
 };
 
 static int mt7622_mcucfg_probe(struct udevice *dev)
@@ -687,17 +694,17 @@ static int mt7622_apmixedsys_probe(struct udevice *dev)
 
 static int mt7622_topckgen_probe(struct udevice *dev)
 {
-	return mtk_common_clk_init(dev, &mt7622_clk_tree);
+	return mtk_common_clk_init(dev, &mt7622_topckgen_clk_tree);
 }
 
 static int mt7622_infracfg_probe(struct udevice *dev)
 {
-	return mtk_common_clk_infrasys_init(dev, &mt7622_infra_clk_tree);
+	return mtk_common_clk_init(dev, &mt7622_infra_clk_tree);
 }
 
 static int mt7622_pericfg_probe(struct udevice *dev)
 {
-	return mtk_common_clk_infrasys_init(dev, &mt7622_peri_clk_tree);
+	return mtk_common_clk_init(dev, &mt7622_peri_clk_tree);
 }
 
 static int mt7622_pciesys_probe(struct udevice *dev)
@@ -795,7 +802,7 @@ static const struct udevice_id mt7622_ssusbsys_compat[] = {
 	{ }
 };
 
-U_BOOT_DRIVER(mtk_mcucfg) = {
+U_BOOT_DRIVER(mt7622_mcucfg) = {
 	.name = "mt7622-mcucfg",
 	.id = UCLASS_SYSCON,
 	.of_match = mt7622_mcucfg_compat,
@@ -803,27 +810,29 @@ U_BOOT_DRIVER(mtk_mcucfg) = {
 	.flags = DM_FLAG_PRE_RELOC,
 };
 
-U_BOOT_DRIVER(mtk_clk_apmixedsys) = {
+U_BOOT_DRIVER(mt7622_clk_apmixedsys) = {
 	.name = "mt7622-clock-apmixedsys",
 	.id = UCLASS_CLK,
 	.of_match = mt7622_apmixed_compat,
+	.bind = mtk_common_clk_parent_bind,
 	.probe = mt7622_apmixedsys_probe,
 	.priv_auto	= sizeof(struct mtk_clk_priv),
 	.ops = &mtk_clk_apmixedsys_ops,
 	.flags = DM_FLAG_PRE_RELOC,
 };
 
-U_BOOT_DRIVER(mtk_clk_topckgen) = {
+U_BOOT_DRIVER(mt7622_clk_topckgen) = {
 	.name = "mt7622-clock-topckgen",
 	.id = UCLASS_CLK,
 	.of_match = mt7622_topckgen_compat,
+	.bind = mtk_common_clk_parent_bind,
 	.probe = mt7622_topckgen_probe,
 	.priv_auto	= sizeof(struct mtk_clk_priv),
 	.ops = &mtk_clk_topckgen_ops,
 	.flags = DM_FLAG_PRE_RELOC,
 };
 
-U_BOOT_DRIVER(mtk_clk_infracfg) = {
+U_BOOT_DRIVER(mt7622_clk_infracfg) = {
 	.name = "mt7622-clock-infracfg",
 	.id = UCLASS_CLK,
 	.of_match = mt7622_infracfg_compat,
@@ -833,7 +842,7 @@ U_BOOT_DRIVER(mtk_clk_infracfg) = {
 	.flags = DM_FLAG_PRE_RELOC,
 };
 
-U_BOOT_DRIVER(mtk_clk_pericfg) = {
+U_BOOT_DRIVER(mt7622_clk_pericfg) = {
 	.name = "mt7622-clock-pericfg",
 	.id = UCLASS_CLK,
 	.of_match = mt7622_pericfg_compat,
@@ -843,7 +852,7 @@ U_BOOT_DRIVER(mtk_clk_pericfg) = {
 	.flags = DM_FLAG_PRE_RELOC,
 };
 
-U_BOOT_DRIVER(mtk_clk_pciesys) = {
+U_BOOT_DRIVER(mt7622_clk_pciesys) = {
 	.name = "mt7622-clock-pciesys",
 	.id = UCLASS_CLK,
 	.of_match = mt7622_pciesys_compat,
@@ -853,7 +862,7 @@ U_BOOT_DRIVER(mtk_clk_pciesys) = {
 	.ops = &mtk_clk_gate_ops,
 };
 
-U_BOOT_DRIVER(mtk_clk_ethsys) = {
+U_BOOT_DRIVER(mt7622_clk_ethsys) = {
 	.name = "mt7622-clock-ethsys",
 	.id = UCLASS_CLK,
 	.of_match = mt7622_ethsys_compat,
@@ -863,7 +872,7 @@ U_BOOT_DRIVER(mtk_clk_ethsys) = {
 	.ops = &mtk_clk_gate_ops,
 };
 
-U_BOOT_DRIVER(mtk_clk_sgmiisys) = {
+U_BOOT_DRIVER(mt7622_clk_sgmiisys) = {
 	.name = "mt7622-clock-sgmiisys",
 	.id = UCLASS_CLK,
 	.of_match = mt7622_sgmiisys_compat,
@@ -872,7 +881,7 @@ U_BOOT_DRIVER(mtk_clk_sgmiisys) = {
 	.ops = &mtk_clk_gate_ops,
 };
 
-U_BOOT_DRIVER(mtk_clk_ssusbsys) = {
+U_BOOT_DRIVER(mt7622_clk_ssusbsys) = {
 	.name = "mt7622-clock-ssusbsys",
 	.id = UCLASS_CLK,
 	.of_match = mt7622_ssusbsys_compat,

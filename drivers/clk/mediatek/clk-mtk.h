@@ -32,6 +32,15 @@
 
 #define ETHSYS_HIFSYS_RST_CTRL_OFS	0x34
 
+/* These get matched to CLK_PARENT_* when looking up parent clocks. */
+enum mtk_clk_tree_type {
+	MTK_CLK_TREE_NONE,
+	MTK_CLK_TREE_APMIXED,
+	MTK_CLK_TREE_TOPCKGEN,
+	MTK_CLK_TREE_INFRASYS,
+	MTK_CLK_TREE_NUM_TYPES
+};
+
 /* struct mtk_pll_data - hardware-specific PLLs data */
 struct mtk_pll_data {
 	/* unmapped ID of clock */
@@ -261,16 +270,21 @@ struct mtk_clk_tree {
 	const int num_muxes;
 	const int num_gates;
 	u32 flags;
+	/*
+	 * Set this if this tree provides a specific type for parent lookup.
+	 * Devices that set this should also include mtk_common_clk_parent_bind()
+	 * in the driver bind function to ensure that it will be registered as
+	 * a provider.
+	 */
+	enum mtk_clk_tree_type type;
 };
 
 struct mtk_clk_priv {
-	struct udevice *parent;
 	void __iomem *base;
 	const struct mtk_clk_tree *tree;
 };
 
 struct mtk_cg_priv {
-	struct udevice *parent;
 	void __iomem *base;
 	const struct mtk_clk_tree *tree;
 	const struct mtk_gate *gates;
@@ -284,10 +298,9 @@ extern const struct clk_ops mtk_clk_topckgen_ops;
 extern const struct clk_ops mtk_clk_infrasys_ops;
 extern const struct clk_ops mtk_clk_gate_ops;
 
+int mtk_common_clk_parent_bind(struct udevice *dev);
 int mtk_common_clk_init(struct udevice *dev,
 			const struct mtk_clk_tree *tree);
-int mtk_common_clk_infrasys_init(struct udevice *dev,
-				 const struct mtk_clk_tree *tree);
 int mtk_common_clk_gate_init(struct udevice *dev,
 			     const struct mtk_clk_tree *tree,
 			     const struct mtk_gate *gates, int num_gates,

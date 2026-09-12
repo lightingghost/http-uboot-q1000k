@@ -516,7 +516,7 @@ bool bloblist_exists(void);
  * If CONFIG_BLOBLIST_PASSAGE_MANDATORY is selected, bloblist in the incoming
  * standard passage is mandatorily required.
  *
- * Sets GD_FLG_BLOBLIST_READY in global_data flags on success
+ * Sets GD_FLG_BLOBLIST_HANDOFF in global_data flags on success
  *
  * Return: 0 if OK, -ve on error
  */

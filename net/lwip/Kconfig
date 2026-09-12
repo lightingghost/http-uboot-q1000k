@@ -81,6 +81,16 @@ config HTTPD_RECOVERY
 	  192.168.255.1 and flashes uploaded images to MTD partitions or
 	  UBI volumes selected through recovery_* environment variables.
 
+config Q1000K_INSTALLER
+	bool "Q1000K chainloader and UBI installer"
+	depends on HTTPD_RECOVERY && TARGET_AN7581 && CMD_UBI
+	depends on AIROHA_SNFI_NAND_WRITE_GUARD && ENV_IS_NOWHERE
+	help
+	  Enable explicit Q1000K installation through HTTP. Validate the
+	  uploaded chainloader and the vendor environment/BBT/BMT before
+	  writing. Preserve the fixed ART boundary and keep other access
+	  read-only until a complete validated upload is acknowledged.
+
 config USE_TFTPSERVERIP
 	bool "Set a default 'tftpserverip' value in the environment"
 	depends on CMD_TFTPBOOT

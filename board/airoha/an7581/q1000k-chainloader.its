@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: GPL-2.0+
+/dts-v1/;
+
+/ {
+	description = "Q1000K U-Boot chainloader FIT";
+	q1000k,installer-version = <1>;
+	#address-cells = <1>;
+
+	images {
+		kernel-1 {
+			/* The stock bootm Linux path directly enters U-Boot. */
+			description = "Q1000K second-stage U-Boot";
+			data = /incbin/("u-boot.bin");
+			type = "kernel";
+			arch = "arm64";
+			os = "linux";
+			compression = "none";
+			load = <0x81e00000>;
+			entry = <0x81e00000>;
+			hash-1 {
+				algo = "crc32";
+			};
+			hash-2 {
+				algo = "sha1";
+			};
+		};
+		fdt-1 {
+			description = "Q1000K U-Boot device tree";
+			data = /incbin/("q1000k.dtb");
+			type = "flat_dt";
+			arch = "arm64";
+			compression = "none";
+			load = <0x82000000>;
+			hash-1 {
+				algo = "crc32";
+			};
+			hash-2 {
+				algo = "sha1";
+			};
+		};
+	};
+
+	configurations {
+		default = "conf-uboot";
+		conf-uboot {
+			description = "Q1000K direct U-Boot chainload";
+			kernel = "kernel-1";
+			fdt = "fdt-1";
+		};
+	};
+};

@@ -3,8 +3,9 @@
 <head>
 <meta charset='utf-8'>
 <meta name='viewport' content='width=device-width,initial-scale=1'>
-<title>XR1710G Recovery Mode</title>
+<title>AN7581 Recovery Mode</title>
 <style>
+[hidden]{display:none!important}
 :root{
   color-scheme:light;
   --bg:#f2f4f8;
@@ -217,7 +218,7 @@ button,input,select{font:inherit;letter-spacing:0}
 }
 .file-help.ok{color:var(--green)}
 .file-help.error{color:var(--red)}
-.upload-wrap{display:flex;justify-content:center;margin-top:20px}
+.upload-wrap{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;margin-top:20px}
 .upload-button{
   min-width:160px;
   min-height:46px;
@@ -234,6 +235,14 @@ button,input,select{font:inherit;letter-spacing:0}
 }
 .upload-button:hover:not(:disabled){background:var(--blue-dark);transform:translateY(-1px);box-shadow:0 9px 22px rgba(40,120,227,.24)}
 .upload-button:disabled{cursor:default;opacity:.42;box-shadow:none}
+.self-write-button{color:var(--blue-dark);border-color:#9abfee;background:#f5f9ff;box-shadow:none}
+.self-write-button:hover:not(:disabled){color:#ffffff}
+.nand-backup{
+  margin-top:24px;
+}
+.nand-backup strong{display:block;color:#465363;font-size:13px;font-weight:720}
+.nand-backup p{margin:7px 0 0;color:var(--muted);font-size:12px;line-height:1.55}
+.nand-backup .upload-wrap{justify-content:flex-start;margin-top:14px}
 .progress-section{
   margin-top:28px;
   padding-top:22px;
@@ -331,12 +340,14 @@ button,input,select{font:inherit;letter-spacing:0}
 <div class='app'>
   <aside class='sidebar'>
     <div class='brand'>
-      <div><strong>XR1710G Recovery Mode</strong><span>Recovery WebUI</span></div>
+      <div><strong id='brand-name'>AN7581 Recovery Mode</strong><span>Recovery WebUI</span></div>
     </div>
     <p class='nav-label'>Recovery</p>
     <nav class='nav' aria-label='Recovery target'>
       <button class='nav-button active' type='button' data-target='firmware' aria-current='page'><span class='nav-dot'></span>Firmware Recovery</button>
-      <button class='nav-button' type='button' data-target='uboot'><span class='nav-dot'></span>Update U-Boot</button>
+      <button class='nav-button' id='recovery-nav-button' type='button' data-target='recovery' hidden><span class='nav-dot'></span>Recovery Image</button>
+      <button class='nav-button' id='uboot-nav-button' type='button' data-target='uboot' hidden><span class='nav-dot'></span>Update U-Boot</button>
+      <button class='nav-button' id='nand-backup-nav-button' type='button' data-target='backup' hidden><span class='nav-dot'></span>NAND Backup</button>
     </nav>
     <div class='side-meta'>
       <strong>192.168.255.1</strong>
@@ -353,11 +364,19 @@ button,input,select{font:inherit;letter-spacing:0}
             <p id='page-copy'>Upload an OpenWrt FIT image and recreate the selected UBI layout.</p>
           </header>
 
+          <div id='flash-page'>
+          <div class='layout-block' id='uboot-mode-block' hidden>
+            <label class='layout-label' for='uboot-mode'>U-Boot operation</label>
+            <select class='layout-select' id='uboot-mode'>
+              <option value='update'>Update U-Boot only (keep UBI)</option>
+              <option value='install'>Install U-Boot and prepare UBI (erase firmware and settings)</option>
+            </select>
+          </div>
           <div class='target-info'>
             <span class='target-label'>Target</span><span class='target-value' id='target-value'>ubi:fit</span>
             <span class='target-label'>Operation</span><span class='target-value' id='scope-value'>Erase and recreate the complete selected UBI partition</span>
             <span class='target-label'>Recovery</span><span class='target-value' id='preserve-value'>Factory data is restored from DSD; saved U-Boot environment is reset</span>
-            <span class='target-label'>Detected</span><span class='target-value' id='detected-layout'>Checking current layout...</span>
+            <span class='target-label' id='layout-status-label'>Detected</span><span class='target-value' id='detected-layout'>Checking current layout...</span>
           </div>
 
           <div class='layout-block' id='layout-block'>
@@ -382,6 +401,7 @@ button,input,select{font:inherit;letter-spacing:0}
 
           <div class='upload-wrap'>
             <button class='upload-button' id='upload-button' type='button' disabled>Upload and Recover</button>
+            <button class='upload-button self-write-button' id='self-write-button' type='button' hidden>Install Running Image</button>
           </div>
 
           <section class='progress-section' aria-label='Recovery progress'>
@@ -416,9 +436,20 @@ button,input,select{font:inherit;letter-spacing:0}
               <li>The device restarts automatically when recovery completes.</li>
             </ul>
           </aside>
+          </div>
+
+          <section class='nand-backup' id='nand-backup-section' hidden>
+            <strong>Complete NAND backup</strong>
+            <p id='nand-backup-copy'>Download the complete NAND data area without modifying storage.</p>
+            <p>Includes factory data, the chainloader and firmware. Spare/OOB bytes are not included.</p>
+            <div class='upload-wrap'>
+              <button class='upload-button' id='nand-backup-button' type='button' disabled>Download NAND Backup</button>
+            </div>
+            <p id='nand-backup-status' role='status'>Save the backup on your computer before installing or updating firmware.</p>
+          </section>
         </div>
       </section>
-      <footer class='footer' id='footer-version'>XR1710G HTTP Recovery</footer>
+      <footer class='footer' id='footer-version'>AN7581 HTTP Recovery</footer>
     </div>
   </main>
 </div>
@@ -426,6 +457,13 @@ button,input,select{font:inherit;letter-spacing:0}
 <script>
 var activeTarget='firmware';
 var selectedLayout='2.0';
+var rawFirmware=false;
+var fixedUbiLayout=false;
+var selfWriteAvailable=false;
+var chainloaderUpdateAvailable=false;
+var q1000kInstaller=false;
+var ubootMode='update';
+var nandBackupAvailable=false;
 var selectedFile=null;
 var busy=false;
 var pollTimer=null;
@@ -433,6 +471,10 @@ var pollEpoch=0;
 var pollOutcome=0;
 
 var profiles={
+  backup:{
+    title:'NAND Backup',
+    copy:'Save a complete image of the NAND data area. Backup uses read-only access and does not change storage.'
+  },
 	  firmware:{
 	    title:'Firmware Recovery',
 	    copy:'Upload an OpenWrt FIT image and recreate the selected UBI layout.',
@@ -445,13 +487,13 @@ var profiles={
   },
   uboot:{
     title:'Update U-Boot',
-    copy:'Upload an XR1710G chainloader image. Only the raw U-Boot slot will be written.',
+	    copy:'Upload a bare XG2010G FIT or a legacy packaged slot. The device normalizes it to the bootable FIT slot.',
     target:'SPI-NAND @ 0x600000',
-    scope:'Write the 1 MiB chainloader slot',
+    scope:'Erase the 1 MiB chainloader window and write FIT at offset 0',
     preserve:'All UBI firmware volumes and configuration data',
-    help:'U-Boot images must not exceed 1 MiB',
+    help:'Upload a FIT, or a legacy slot containing a FIT at offset 0x2100; the stored image is a raw FIT',
     action:'Upload and Update',
-    notices:['Do not power off the device during the U-Boot update.','The image format is validated before writing.','UBI firmware volumes are not modified.']
+    notices:['Do not power off the device during the U-Boot update.','FIT and legacy slot formats are validated before writing.','Only the chainloader partition is modified; UBI firmware volumes are not touched.']
   }
 };
 
@@ -462,31 +504,46 @@ var layouts={
 };
 
 var fileInput=document.getElementById('file-input');
+var ubootNavButton=document.getElementById('uboot-nav-button');
 var chooseButton=document.getElementById('choose-button');
 var fileName=document.getElementById('file-name');
 var fileHelp=document.getElementById('file-help');
 var uploadButton=document.getElementById('upload-button');
+var selfWriteButton=document.getElementById('self-write-button');
+var nandBackupSection=document.getElementById('nand-backup-section');
+var nandBackupButton=document.getElementById('nand-backup-button');
+var nandBackupCopy=document.getElementById('nand-backup-copy');
+var nandBackupNavButton=document.getElementById('nand-backup-nav-button');
 var layoutBlock=document.getElementById('layout-block');
 var layoutSelect=document.getElementById('layout-select');
 var layoutHelp=document.getElementById('layout-help');
+var ubootModeSelect=document.getElementById('uboot-mode');
 var state=document.getElementById('state');
 var statusMessage=document.getElementById('status-message');
 
-function profile(){return profiles[activeTarget]}
+function profile(){
+  return q1000kInstaller&&activeTarget==='uboot'&&ubootMode==='update'?profiles.ubootUpdate:profiles[activeTarget];
+}
+
+function setUbootMode(mode){
+  if(busy||(mode!=='update'&&mode!=='install'))return;
+  ubootMode=mode;
+  setTarget(activeTarget);
+}
 
 function updateLayout(){
   var layout=layouts[selectedLayout]||layouts['2.0'];
-  layoutBlock.hidden=activeTarget!=='firmware';
+  layoutBlock.hidden=activeTarget!=='firmware'||rawFirmware||fixedUbiLayout;
   layoutSelect.value=selectedLayout;
   layoutHelp.textContent=layout.help;
   layoutHelp.className='layout-help'+(layout.warning?' warning':'');
   if(activeTarget==='firmware'){
-    document.getElementById('target-value').textContent=layout.part+':fit ('+layout.size+', ends '+layout.end+')';
+    document.getElementById('target-value').textContent=layout.part+':fit ('+layout.size+(layout.start?' partition, '+layout.start+' to '+layout.end+' exclusive':', ends '+layout.end)+')';
   }
 }
 
 function setTarget(target){
-  if(busy||!profiles[target])return;
+  if(busy||!profiles[target]||(target==='uboot'&&!chainloaderUpdateAvailable)||(target==='recovery'&&!q1000kInstaller)||(target==='backup'&&!nandBackupAvailable))return;
   activeTarget=target;
   var p=profile();
   var buttons=document.querySelectorAll('.nav-button');
@@ -498,11 +555,20 @@ function setTarget(target){
   }
   document.getElementById('page-title').textContent=p.title;
   document.getElementById('page-copy').textContent=p.copy;
+  document.getElementById('flash-page').hidden=target==='backup';
+  nandBackupSection.hidden=target!=='backup';
+  if(target==='backup'){
+    uploadButton.disabled=true;
+    return;
+  }
 	  document.getElementById('target-value').textContent=p.target;
   document.getElementById('scope-value').textContent=p.scope;
   document.getElementById('preserve-value').textContent=p.preserve;
   fileHelp.textContent=p.help;
   uploadButton.textContent=p.action;
+  selfWriteButton.hidden=target!=='uboot'||!selfWriteAvailable;
+  document.getElementById('uboot-mode-block').hidden=target!=='uboot'||!q1000kInstaller;
+  ubootModeSelect.value=ubootMode;
   var list=document.getElementById('notice-list');
   list.textContent='';
 	  for(var n=0;n<p.notices.length;n++){
@@ -523,12 +589,13 @@ function formatBytes(bytes){
 
 function fileError(){
   if(!selectedFile)return'';
-  if(activeTarget==='firmware'&&selectedFile.size<1024*1024)return'Firmware images must be at least 1 MiB.';
+  if(activeTarget!=='uboot'&&selectedFile.size<1024*1024)return'Firmware images must be at least 1 MiB.';
   if(activeTarget==='uboot'&&selectedFile.size>1024*1024)return'U-Boot images must not exceed 1 MiB.';
   return'';
 }
 
 function validateFile(){
+  if(activeTarget==='backup'){uploadButton.disabled=true;return;}
   var error=fileError();
   fileHelp.className='file-help';
   if(!selectedFile){
@@ -557,7 +624,10 @@ function setBusy(value){
   chooseButton.disabled=value;
   var buttons=document.querySelectorAll('.nav-button');
 	  for(var i=0;i<buttons.length;i++)buttons[i].disabled=value;
-	  layoutSelect.disabled=value;
+  layoutSelect.disabled=value;
+  ubootModeSelect.disabled=value;
+  selfWriteButton.disabled=value;
+  nandBackupButton.disabled=value;
   validateFile();
 }
 
@@ -640,7 +710,13 @@ function startStatusPolling(epoch,label,message){
 }
 
 async function upload(){
-  if(!selectedFile||fileError())return;
+  if(busy||activeTarget==='backup'||!selectedFile||fileError())return;
+  if(q1000kInstaller&&activeTarget==='uboot'){
+    var confirmation=ubootMode==='install'?
+      'Install this chainloader, erase all firmware and settings in the 438 MiB UBI partition, and change vendor bootcmd? After reboot, upload OpenWrt firmware.':
+      'Replace the chainloader only? All UBI volumes, firmware, settings and the vendor boot command will be preserved.';
+    if(!window.confirm(confirmation))return;
+  }
   setBusy(true);
   resetProgress();
   pollEpoch++;
@@ -689,10 +765,53 @@ async function upload(){
     setBusy(false);
   });
 	  var uploadUri='/upload/'+activeTarget;
-	  if(activeTarget==='firmware')uploadUri+='?layout='+encodeURIComponent(selectedLayout);
+	  if(q1000kInstaller&&activeTarget==='uboot'&&ubootMode==='update')uploadUri='/upload/uboot-only';
+	  if(activeTarget==='firmware'&&!rawFirmware&&!fixedUbiLayout)uploadUri+='?layout='+encodeURIComponent(selectedLayout);
 	  xhr.open('POST',uploadUri,true);
   xhr.setRequestHeader('Content-Type','application/octet-stream');
   xhr.send(payload);
+}
+
+function installRunningImage(){
+  if(busy||activeTarget!=='uboot'||!selfWriteAvailable)return;
+  if(!window.confirm('Install the running chainloader into the 1 MiB NAND slot?'))return;
+  setBusy(true);
+  resetProgress();
+  pollEpoch++;
+  pollOutcome=0;
+  setProgress('upload',100,'complete');
+  setState('Validating','working','Validating the running chainloader FIT.');
+
+  var xhr=new XMLHttpRequest();
+  xhr.addEventListener('load',function(){
+    if(xhr.status<200||xhr.status>=300){
+      setState('Rejected','error','The running image could not be validated.');
+      setBusy(false);
+      return;
+    }
+    setState('Processing','working','Waiting for erase and verified write operations.');
+    var epoch=pollEpoch;
+    pollTimer=setInterval(function(){pollStatus(epoch)},500);
+    setTimeout(function(){pollStatus(epoch)},100);
+  });
+  xhr.addEventListener('error',function(){
+    setState('Network Error','error','The install request failed.');
+    setBusy(false);
+  });
+  xhr.open('POST','/action/self-write',true);
+  xhr.setRequestHeader('Content-Type','text/plain');
+  xhr.send('XG2010G_INSTALL');
+}
+
+function downloadNandBackup(){
+  if(busy||activeTarget!=='backup'||!nandBackupAvailable)return;
+  var link=document.createElement('a');
+  link.href='/backup/q1000k-nand.bin';
+  link.style.display='none';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  document.getElementById('nand-backup-status').textContent='Download requested. Follow progress in your browser and keep the device powered until the download finishes.';
 }
 
 var navButtons=document.querySelectorAll('.nav-button');
@@ -708,19 +827,116 @@ layoutSelect.addEventListener('change',function(){
   resetProgress();
 });
 uploadButton.addEventListener('click',upload);
+ubootModeSelect.addEventListener('change',function(){setUbootMode(this.value)});
+selfWriteButton.addEventListener('click',installRunningImage);
+nandBackupButton.addEventListener('click',downloadNandBackup);
+
+function applyQ1000kProfile(){
+  fixedUbiLayout=true;
+  q1000kInstaller=chainloaderUpdateAvailable;
+  document.getElementById('recovery-nav-button').hidden=!q1000kInstaller;
+  layouts['2.0']={part:'ubi',size:'438 MiB',start:'0x00700000',end:'0x1bd00000',help:'Fixed Q1000K partition; usable firmware capacity is smaller due to UBI overhead and reserved volumes.'};
+  layoutSelect.querySelector("option[value='2.0']").textContent='UBI 2.0 - 438 MiB (Q1000K)';
+  profiles.firmware.copy='After Install U-Boot and prepare UBI completes, upload the Q1000K OpenWrt sysupgrade FIT.';
+  profiles.firmware.scope='Replace fit and recreate rootfs_data (erase OpenWrt settings)';
+  profiles.firmware.preserve='ubootenv, ubootenv2, 64 KiB factory and recovery volumes; DSD, ART and vendor BMT/BBT';
+  profiles.firmware.help='Q1000K sysupgrade FIT (.itb), 1–256 MiB, with the fixed 438 MiB UBI layout';
+  profiles.firmware.notices=['For first-time setup, choose Install U-Boot and prepare UBI on the Update U-Boot page.','This upload replaces production firmware and resets the OpenWrt overlay.','Factory metadata and the separately uploaded recovery image are preserved.','Do not power off during installation. The device restarts when writing and verification finish.'];
+  profiles.uboot={
+    title:'Update U-Boot',
+    copy:'Install the Q1000K chainloader and prepare UBI. Upload OpenWrt firmware after the device restarts.',
+    target:'Chainloader at 0x600000; vendor bootcmd; 438 MiB UBI',
+    scope:'Write and verify chainloader, format UBI, then update vendor bootcmd',
+    preserve:'Stock first stage, other vendor environment variables, DSD, ART and BMT/BBT',
+    help:'Upload q1000k-chainload-uboot.itb built with installer support (at most 1 MiB)',
+    action:'Install U-Boot and Prepare UBI',
+    notices:['This erases all existing firmware and settings in UBI, including previous recovery images.','Creates ubootenv (ID 0), ubootenv2 (1), factory (2), recovery (3), fit (4) and rootfs_data (5).','The static 64 KiB factory volume contains MACs, unit serial, PON authentication serial (FSAN), and both GPON and XGS-PON optical calibration records; Wi-Fi and fan fields stay empty.','Recovery and fit start empty. After reboot, upload a sysupgrade FIT; optionally upload an initramfs recovery FIT.','The installer requires supported, empty vendor BBT/BMT tables and a valid vendor environment.','Keep power connected: the single-copy vendor environment is updated last, but replacement is not power-loss atomic.']
+  };
+  profiles.ubootUpdate={
+    title:'Update U-Boot',
+    copy:'Replace the Q1000K chainloader and keep your installed firmware, recovery image and settings.',
+    target:'1 MiB chainloader slot at 0x600000',
+    scope:'Write and verify the chainloader only',
+    preserve:'All UBI volumes, factory/PON data, firmware, settings and vendor environment',
+    help:'Upload q1000k-chainload-uboot.itb built with installer support (at most 1 MiB)',
+    action:'Update U-Boot Only',
+    notices:['UBI is not attached or formatted during this update.','The existing vendor boot command is preserved. For first-time setup, choose Install U-Boot and prepare UBI.','Keep power connected while the chainloader is written and verified. The device restarts after success.']
+  };
+  profiles.recovery={
+    title:'Recovery Image',
+    copy:'Upload a Q1000K initramfs recovery FIT for fallback boot if production firmware cannot boot.',
+    target:'ubi:recovery (volume ID 3)',
+    scope:'Replace recovery and recreate rootfs_data (erase OpenWrt settings)',
+    preserve:'Production fit, ubootenv, ubootenv2 and factory volumes; DSD, ART and vendor BMT/BBT',
+    help:'Q1000K initramfs recovery FIT (.itb), 1–256 MiB, with the fixed 438 MiB UBI layout',
+    action:'Upload Recovery Image',
+    notices:['Choose Install U-Boot and prepare UBI first.','This upload resets the OpenWrt overlay to resize the recovery volume.','Production firmware and factory metadata are preserved.','After installation, boot tries fit, then recovery, then HTTP recovery. Hold Reset while starting the chainloader to open HTTP recovery.','Do not power off during writing and verification.']
+  };
+  document.getElementById('layout-status-label').textContent='Configured';
+  document.getElementById('detected-layout').textContent='438 MiB fixed UBI target';
+}
+
+(function(){
+  if(location.protocol!=='file:')return;
+  chainloaderUpdateAvailable=true;
+  ubootNavButton.hidden=false;
+  applyQ1000kProfile();
+  nandBackupCopy.textContent='Preview: the Q1000K recovery server enables this control and streams the complete NAND data area.';
+  nandBackupAvailable=true;
+  nandBackupNavButton.hidden=false;
+})();
 
 (async function(){
   setTarget('firmware');
   try{
     var response=await fetch('/about',{cache:'no-store'});
-    var data=await response.json();
-	    if(data&&data.u_boot){
-      document.getElementById('version').textContent=data.u_boot;
-	      document.getElementById('footer-version').textContent=data.u_boot;
+	    var data=await response.json();
+	    if(data&&data.board){
+	      document.getElementById('brand-name').textContent=data.board+' Recovery Mode';
+	      document.title=data.board+' Recovery Mode';
+	      chainloaderUpdateAvailable=!!data.chainloader_update;
+	      selfWriteAvailable=chainloaderUpdateAvailable&&data.board==='XG2010G';
+	      ubootNavButton.hidden=!chainloaderUpdateAvailable;
 	    }
-	    if(data&&data.detected_layout){
+	    if(data&&data.nand_backup){
+	      var backupSize=data.nand_backup_bytes||0;
+	      nandBackupCopy.textContent='Download a '+formatBytes(backupSize)+' image of the complete SPI-NAND data area. It includes factory data and the chainloader; storage is not modified.';
+	      nandBackupAvailable=true;
+	      nandBackupNavButton.hidden=false;
+	      nandBackupButton.disabled=false;
+	    }
+	    if(data&&(data.board==='XG2010G'||data.board==='Q1000K')&&data.firmware_mode==='ubi'){
+	      fixedUbiLayout=true;
+	      layouts['2.0']={part:'ubi',size:'438 MiB',end:'0x1bd00000',help:'Fixed Q1000K/XG2010G layout preserving the external ART and BMT/BBT regions.'};
+	      profiles.firmware.preserve='DSD and ART factory data remain outside UBI; U-Boot environment uses redundant UBI volumes';
+	      profiles.firmware.notices=['Do not power off the device during recovery.','The fixed 438 MiB UBI partition is erased and rebuilt.','DSD, ART and the vendor BMT/BBT area are not modified.','The device restarts automatically when recovery completes.'];
+	      document.getElementById('detected-layout').textContent='438 MiB fixed UBI layout';
+	    }
+	    if(data&&data.board==='Q1000K'&&data.firmware_mode==='ubi'){
+	      applyQ1000kProfile();
+	    }
+	    if(data&&data.firmware_mode==='raw'){
+	      rawFirmware=true;
+	      profiles.firmware={
+	        title:'Firmware Recovery',
+	        copy:'Upload a complete vendor firmware-slot image for the backup boot slot.',
+	        target:'tclinux_slave (64 MiB)',
+	        scope:'Erase and rewrite the complete backup firmware slot',
+	        preserve:'Primary U-Boot slot, DSD, system data, ART and reserved NAND areas',
+	        help:'Vendor-slot images must be at least 1 MiB and contain a FIT at offset 0x2100',
+	        action:'Upload and Recover',
+	        notices:['Do not power off the device during recovery.','The complete 64 MiB backup slot is erased before writing.','The vendor prefix and FIT structure are validated before writing.','The device restarts automatically when recovery completes.']
+	      };
+	      document.getElementById('detected-layout').textContent='64 MiB raw backup slot';
+	    }
+	    if(data&&data.u_boot){
+	      document.getElementById('version').textContent=data.u_boot;
+	      document.getElementById('footer-version').textContent=(data.board?data.board+' - ':'')+data.u_boot;
+	    }
+	    if(data&&data.detected_layout&&data.firmware_mode!=='raw'&&!fixedUbiLayout){
 	      document.getElementById('detected-layout').textContent='UBI '+data.detected_layout;
 	    }
+	    setTarget(activeTarget);
   }catch(error){}
 })();
 </script>

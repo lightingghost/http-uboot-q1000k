@@ -7212,6 +7212,11 @@ fdt         fdtmap                Extract the devicetree blob from the fdtmap
         configlen_noheader = TI_BOARD_CONFIG_DATA * 4
         self.assertGreater(data, configlen_noheader)
 
+    def testTIBoardConfigCombinedSwRev(self):
+        """Test that sw-rev property is honoured in combined board config"""
+        data = self._DoReadFile('vendor/ti_board_cfg_combined_sw_rev.dts')
+        self.assertEqual(2, data[1])
+
     def testTIBoardConfigNoDataType(self):
         """Test that error is thrown when data type is not supported"""
         with self.assertRaises(ValueError) as e:
@@ -8101,17 +8106,18 @@ fdt         fdtmap                Extract the devicetree blob from the fdtmap
 
     def testNxpImx8MFSPI(self):
         """Test that binman can produce an iMX8m FSPI image"""
-        testdir = tempfile.mkdtemp(prefix='binman.')
-
-        tools.write_file(os.path.join(testdir, 'fspi_header.bin'), tools.get_bytes(0, 448))
-        with terminal.capture():
-            self._DoTestFile('vendor/nxp_imx8m_fspi.dts', output_dir=testdir)
-            self._DoTestFile('vendor/nxp_imx8m_fspi_pass.dts', output_dir=testdir)
-
-        tools.write_file(os.path.join(testdir, 'fspi_header_fail.bin'), tools.get_bytes(0, 4097))
-        with terminal.capture():
-            with self.assertRaises(ValueError) as e:
-                self._DoTestFile('vendor/nxp_imx8m_fspi_fail.dts', output_dir=testdir)
+        self._DoTestFile('vendor/nxp_imx8m_fspi.dts')
+        self._DoTestFile('vendor/nxp_imx8m_fspi_pass.dts')
+        with self.assertRaises(ValueError) as e:
+            self._DoTestFile('vendor/nxp_imx8m_fspi_fail_columnadresswidth.dts')
+        with self.assertRaises(ValueError) as e:
+            self._DoTestFile('vendor/nxp_imx8m_fspi_fail_devicetype.dts')
+        with self.assertRaises(ValueError) as e:
+            self._DoTestFile('vendor/nxp_imx8m_fspi_fail_flashpadtype.dts')
+        with self.assertRaises(ValueError) as e:
+            self._DoTestFile('vendor/nxp_imx8m_fspi_fail_readsampleclksrc.dts')
+        with self.assertRaises(ValueError) as e:
+            self._DoTestFile('vendor/nxp_imx8m_fspi_fail_serialclkfreq.dts')
 
     def testNxpHeaderDdrfw(self):
         """Test that binman can add a header to DDR PHY firmware images"""
@@ -8166,6 +8172,31 @@ fdt         fdtmap                Extract the devicetree blob from the fdtmap
             signature = subnode.FindNode('signature')
             self.assertIsNotNone(signature)
             self.assertIsNotNone(signature.props.get('value'))
+
+    def testFitSignKeydir(self):
+        """Test that the keydir EntryArg is passed to mkimage"""
+        if not elf.ELF_TOOLS:
+            self.skipTest('Python elftools not available')
+        data = tools.read_file(self.TestFile("fit/rsa2048.key"))
+        self._MakeInputFile("keys/rsa2048.key", data)
+
+        test_subdir = os.path.join(self._indir, TEST_FDT_SUBDIR)
+        keys_subdir = os.path.join(self._indir, "keys")
+        entry_args = {
+            'of-list': 'test-fdt1',
+            'default-dt': 'test-fdt1',
+            'atf-bl31-path': 'bl31.elf',
+            'keydir': keys_subdir,
+        }
+        data = self._DoReadFileDtb(
+            'fit/signature.dts',
+            entry_args=entry_args,
+            extra_indirs=[test_subdir])[0]
+
+        dtb = fdt.Fdt.FromData(data)
+        dtb.Scan()
+        signature = dtb.GetNode('/configurations/conf-uboot-1/signature')
+        self.assertIsNotNone(signature.props.get('value'))
 
     def testFitSignEngineSimple(self):
         """Test that image with FIT and signature nodes can be signed with an
@@ -8506,6 +8537,21 @@ fdt         fdtmap                Extract the devicetree blob from the fdtmap
         with open(data_file, 'r') as file:
             dec_data = file.read()
         self.assertEqual(U_BOOT_NODTB_DATA, dec_data.encode('ascii'))
+
+    def testSimpleFitEncryptedDataKeydir(self):
+        """Test that encrypted FIT data uses the keydir EntryArg"""
+        data = tools.read_file(self.TestFile("fit/aes256.bin"))
+        self._MakeInputFile("keys/aes256.bin", data)
+
+        keys_subdir = os.path.join(self._indir, "keys")
+        data = self._DoReadFileDtb(
+            'fit/encrypt_data.dts',
+            entry_args={'keydir': keys_subdir})[0]
+
+        fit = fdt.Fdt.FromData(data)
+        fit.Scan()
+        node = fit.GetNode('/images/u-boot')
+        self.assertIn('data-size-unciphered', fit.GetProps(node))
 
     def testSimpleFitEncryptedDataMissingKey(self):
         """Test an image with a FIT containing data to be encrypted but with a missing key"""

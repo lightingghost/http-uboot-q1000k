@@ -9,6 +9,7 @@
  */
 
 #include <asm/unaligned.h>
+#include <airoha_snand.h>
 #include <clk.h>
 #include <dm.h>
 #include <dm/device_compat.h>
@@ -190,6 +191,56 @@
 #define SPI_NAND_OP_BLOCK_ERASE			0xd8
 #define SPI_NAND_OP_RESET			0xff
 #define SPI_NAND_OP_DIE_SELECT			0xc2
+
+#ifdef CONFIG_AIROHA_SNFI_NAND_WRITE_GUARD
+static bool airoha_snand_write_enabled;
+
+void airoha_snand_set_write_enabled(bool enabled)
+{
+	airoha_snand_write_enabled = enabled;
+}
+#endif
+
+static int airoha_snand_check_write(const struct spi_mem_op *op)
+{
+#ifdef CONFIG_AIROHA_SNFI_NAND_WRITE_GUARD
+	if (airoha_snand_write_enabled)
+		return 0;
+
+	/* Allow only reads and volatile setup used by the Q1000K NAND. */
+	switch (op->cmd.opcode) {
+	case SPI_NAND_OP_PAGE_READ:
+	case SPI_NAND_OP_READ_FROM_CACHE_SINGLE:
+	case SPI_NAND_OP_READ_FROM_CACHE_SINGLE_FAST:
+	case SPI_NAND_OP_READ_FROM_CACHE_DUAL:
+	case SPI_NAND_OP_READ_FROM_CACHE_DUALIO:
+	case SPI_NAND_OP_READ_FROM_CACHE_QUAD:
+	case SPI_NAND_OP_READ_FROM_CACHE_QUADIO:
+	case SPI_NAND_OP_READ_ID:
+	case SPI_NAND_OP_WRITE_DISABLE:
+	case SPI_NAND_OP_RESET:
+	case SPI_NAND_OP_DIE_SELECT:
+	case 0x0f: /* GET FEATURE, including ECC status */
+		return 0;
+	case 0x1f: /* SET FEATURE: block lock and volatile configuration only */
+		if (op->addr.nbytes != 1 || op->data.nbytes != 1 ||
+		    op->data.dir != SPI_MEM_DATA_OUT)
+			return -EROFS;
+		if (op->addr.val == REG_BLOCK_LOCK)
+			return 0;
+		/* Never enable OTP mode or program its permanent lock bit. */
+		if (op->addr.val == REG_CFG &&
+		    !(*(const u8 *)op->data.buf.out & (BIT(7) | CFG_OTP_ENABLE)))
+			return 0;
+		return -EROFS;
+	default:
+		/* Includes WREN, program load/execute, erase and vendor writes. */
+		return -EROFS;
+	}
+#else
+	return 0;
+#endif
+}
 
 /* SNAND FIFO commands */
 #define SNAND_FIFO_TX_BUSWIDTH_SINGLE		0x08
@@ -765,6 +816,10 @@ static ssize_t airoha_snand_dirmap_write(struct spi_mem_dirmap_desc *desc,
 	size_t bytes;
 	int err;
 
+	err = airoha_snand_check_write(&desc->info.op_tmpl);
+	if (err)
+		return err;
+
 	if (!priv->dma) {
 		/* simplified version of spi_mem_no_dirmap_write() */
 		struct spi_mem_op op = desc->info.op_tmpl;
@@ -954,6 +1009,10 @@ static int airoha_snand_exec_op(struct spi_slave *slave,
 	int op_len, addr_len, dummy_len;
 	u8 buf[20], *data;
 	int i, err;
+
+	err = airoha_snand_check_write(op);
+	if (err)
+		return err;
 
 	priv = dev_get_priv(bus);
 

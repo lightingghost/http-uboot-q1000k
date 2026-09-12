@@ -5,8 +5,11 @@
  */
 
 #include <dm.h>
+#include <airoha_snand.h>
+#include <q1000k_installer.h>
 #include <dm/ofnode.h>
 #include <env.h>
+#include <image.h>
 #include <log.h>
 #include <malloc.h>
 #include <memalign.h>
@@ -121,8 +124,19 @@ ulong airoha_recovery_get_lan_activity_ms(void);
 #define RECOVERY_FACTORY_SIZE  (1 * 1024 * 1024UL)
 #define RECOVERY_UBI_WRITE_CHUNK (1024 * 1024U)
 #define RECOVERY_UBOOT_SLOT_FIT_OFFSET 0x2100U
+#define RECOVERY_UBOOT_SLOT_SIZE       (1 * 1024 * 1024UL)
 #define RECOVERY_UBOOT_SLOT_DEFAULT_OFS 0x600000UL
 #define RECOVERY_UBOOT_SLOT_DEFAULT_DEV "spi-nand0"
+#define RECOVERY_Q1000K_NAND_BYTES     0x20000000ULL
+#define RECOVERY_Q1000K_UBI_OFFSET     0x00700000ULL
+#define RECOVERY_Q1000K_UBI_BYTES      0x1b600000ULL
+#define RECOVERY_Q1000K_UPLOAD_OFFSET  0x04000000UL
+#define RECOVERY_Q1000K_UPLOAD_MAX     0x10000000UL
+#define RECOVERY_Q1000K_STACK_MARGIN   0x00100000UL
+#define RECOVERY_NAND_BACKUP_CHUNK      (256 * 1024UL)
+#define RECOVERY_NAND_BACKUP_MAGIC      0x514e424bU
+#define RECOVERY_XG2010G_RUNNING_FIT_ADDR 0x81800000UL
+#define RECOVERY_XG2010G_INSTALL_TOKEN "XG2010G_INSTALL"
 #define RECOVERY_IH_MAGIC 0x27051956U
 #define RECOVERY_FDT_MAGIC 0xd00dfeedU
 
@@ -130,7 +144,10 @@ static u8 *recv_base;
 static u32 recv_off;
 static u32 recv_total;
 static int post_ok;
+static void *post_connection;
+static bool post_validated;
 static int flash_request;
+static bool self_write_request;
 static volatile int reboot_request;
 /* Progress for /status polling */
 static volatile u32 prog_total; /* combined total for backward compat */
@@ -145,6 +162,21 @@ static unsigned long long prog_erase_volume_bytes;
 static struct recovery_status_led_ctrl *prog_status_leds;
 static bool recovery_httpd_started;
 static int recovery_ubi_attach_error;
+static unsigned int recovery_nand_backup_active;
+
+struct recovery_nand_backup_file {
+	u32 magic;
+	struct mtd_info *mtd;
+	u8 *cache;
+	size_t cache_capacity;
+	size_t cache_len;
+	size_t cache_off;
+	loff_t next_offset;
+	unsigned long long bytes_left;
+	char http_header[256];
+	size_t http_header_len;
+	size_t http_header_off;
+};
 
 static void recovery_abort_tcp_list(struct tcp_pcb **list)
 {
@@ -197,11 +229,94 @@ static u32 recovery_be32_to_cpu(const void *p)
 	       ((u32)b[2] << 8) | b[3];
 }
 
+static bool recovery_board_is_xg2010g(void)
+{
+	return of_machine_is_compatible("axon,xg2010g") ||
+	       of_machine_is_compatible("econet,xg2010g");
+}
+
+static bool recovery_board_is_q1000k(void)
+{
+	return of_machine_is_compatible("quantum,q1000k") ||
+	       of_machine_is_compatible("centurylink,q1000k") ||
+	       of_machine_is_compatible("lumen,q1000k");
+}
+
+static bool recovery_uboot_update_disabled(void)
+{
+	if (recovery_board_is_q1000k())
+		return !IS_ENABLED(CONFIG_Q1000K_INSTALLER);
+	return IS_ENABLED(CONFIG_AIROHA_SNFI_NAND_WRITE_GUARD) ||
+	       ofnode_read_bool(ofnode_root(),
+				"recovery-disable-uboot-update");
+}
+
+static bool recovery_fit_has_hashed_image(const void *fit, const char *name)
+{
+	int child;
+	int images;
+	int image;
+
+	images = fdt_path_offset(fit, FIT_IMAGES_PATH);
+	if (images < 0)
+		return false;
+	image = fdt_subnode_offset(fit, images, name);
+	if (image < 0)
+		return false;
+
+	fdt_for_each_subnode(child, fit, image) {
+		const char *child_name = fit_get_name(fit, child, NULL);
+
+		if (!strncmp(child_name, FIT_HASH_NODENAME,
+			     strlen(FIT_HASH_NODENAME)))
+			return true;
+	}
+
+	return false;
+}
+
+static int recovery_validate_xg2010g_chainloader_fit(const void *fit)
+{
+	const char *desc = fdt_getprop(fit, 0, FIT_DESC_PROP, NULL);
+
+	if (!desc || !strstr(desc, "XG2010G") || !strstr(desc, "chainloader") ||
+	    !recovery_fit_has_hashed_image(fit, "fdt@1") ||
+	    !recovery_fit_has_hashed_image(fit, "kernel@1") ||
+	    !recovery_fit_has_hashed_image(fit, "uboot@1")) {
+		printf("U-Boot FIT is not an XG2010G chainloader image\n");
+		return -ENOEXEC;
+	}
+
+	return 0;
+}
+
+static int recovery_validate_fit(const void *fit, size_t size)
+{
+	int ret;
+
+	ret = fit_check_format(fit, size);
+	if (ret)
+		return ret;
+	if (recovery_board_is_xg2010g()) {
+		ret = recovery_validate_xg2010g_chainloader_fit(fit);
+		if (ret)
+			return ret;
+	}
+	if (!fit_all_image_verify(fit)) {
+		printf("XG2010G U-Boot FIT image hash verification failed\n");
+		return -EBADMSG;
+	}
+	return 0;
+}
+
 enum upload_target {
 	TARGET_FIRMWARE = 0,
 	TARGET_UBOOT,
+	TARGET_RECOVERY,
 };
 static enum upload_target current_target = TARGET_FIRMWARE;
+/* Bound to the accepted POST until its response is acknowledged and committed. */
+static bool q1000k_uboot_only;
 
 struct recovery_ubi_layout {
 	const char *version;
@@ -233,15 +348,6 @@ struct recovery_target {
 	bool ubi_needs_format;
 };
 
-struct recovery_led_ctrl {
-	struct udevice *mdio_dev;
-	ulong last_poll;
-	ulong last_phy_poll;
-	ulong last_mdio_error;
-	bool mdio_fault;
-	int speed[RECOVERY_LED_PORTS];
-};
-
 struct recovery_gpio_pin {
 	struct gpio_desc desc;
 	ofnode node;
@@ -249,6 +355,19 @@ struct recovery_gpio_pin {
 	s8 last_on;
 	bool active_low;
 	bool valid;
+};
+
+struct recovery_led_ctrl {
+	struct udevice *mdio_dev;
+	struct recovery_gpio_pin green[RECOVERY_LED_PORTS];
+	struct recovery_gpio_pin yellow[RECOVERY_LED_PORTS];
+	u8 phy_addr[RECOVERY_LED_PORTS];
+	ulong last_poll;
+	ulong last_phy_poll;
+	ulong last_mdio_error;
+	bool mdio_fault;
+	int port_count;
+	int speed[RECOVERY_LED_PORTS];
 };
 
 struct recovery_status_led_ctrl {
@@ -275,10 +394,6 @@ struct recovery_dhcp_server {
 	ip4_addr_t broadcast;
 	ip4_addr_t dns;
 };
-
-static const int recovery_led_phy_addrs[RECOVERY_LED_PORTS] = { 9, 10 };
-static const u8 recovery_green_led_gpios[RECOVERY_LED_PORTS] = { 43, 44 };
-static const u8 recovery_yellow_led_gpios[RECOVERY_LED_PORTS] = { 33, 34 };
 
 static void recovery_led_ctrl_free(struct recovery_led_ctrl *ctrl)
 {
@@ -370,9 +485,10 @@ static void recovery_gpio_set_value(u8 gpio, bool active_low, int active)
 	recovery_clrsetbits_le32(reg, bit, set);
 }
 
-static void recovery_led_set_pin(u8 gpio, int on)
+static void recovery_led_set_pin(struct recovery_gpio_pin *pin, int on)
 {
-	recovery_gpio_set_value(gpio, true, on);
+	if (pin->valid)
+		recovery_gpio_set_value(pin->gpio, pin->active_low, on);
 }
 
 static void recovery_led_stop(struct recovery_led_ctrl *ctrl)
@@ -382,9 +498,9 @@ static void recovery_led_stop(struct recovery_led_ctrl *ctrl)
 	if (!ctrl)
 		return;
 
-	for (i = 0; i < RECOVERY_LED_PORTS; i++) {
-		recovery_led_set_pin(recovery_green_led_gpios[i], 0);
-		recovery_led_set_pin(recovery_yellow_led_gpios[i], 0);
+	for (i = 0; i < ctrl->port_count; i++) {
+		recovery_led_set_pin(&ctrl->green[i], 0);
+		recovery_led_set_pin(&ctrl->yellow[i], 0);
 	}
 }
 
@@ -425,7 +541,8 @@ static ofnode recovery_led_alias_node(const char *alias)
 	return ofnode_path(path);
 }
 
-static int recovery_led_node_to_gpio(ofnode node, struct recovery_gpio_pin *pin)
+static int recovery_node_prop_to_gpio(ofnode node, const char *prop, int index,
+				      struct recovery_gpio_pin *pin)
 {
 	struct ofnode_phandle_args args;
 	int ret;
@@ -435,7 +552,7 @@ static int recovery_led_node_to_gpio(ofnode node, struct recovery_gpio_pin *pin)
 	if (!ofnode_valid(node))
 		return -ENOENT;
 
-	ret = ofnode_parse_phandle_with_args(node, "gpios", "#gpio-cells", 0, 0,
+	ret = ofnode_parse_phandle_with_args(node, prop, "#gpio-cells", 0, index,
 					     &args);
 	if (ret)
 		return ret;
@@ -451,6 +568,11 @@ static int recovery_led_node_to_gpio(ofnode node, struct recovery_gpio_pin *pin)
 	pin->valid = true;
 
 	return 0;
+}
+
+static int recovery_led_node_to_gpio(ofnode node, struct recovery_gpio_pin *pin)
+{
+	return recovery_node_prop_to_gpio(node, "gpios", 0, pin);
 }
 
 static void recovery_status_led_add(struct recovery_status_led_ctrl *ctrl,
@@ -1175,10 +1297,32 @@ static void recovery_dhcp_server_stop(struct recovery_dhcp_server *srv)
 
 static int recovery_led_init(struct recovery_led_ctrl *ctrl)
 {
-	ofnode mdio_node;
+	ofnode mdio_node, root;
 	int i, ret;
 
 	memset(ctrl, 0, sizeof(*ctrl));
+	root = ofnode_path("/");
+	mdio_node = ofnode_parse_phandle(root, "recovery-link-mdio", 0);
+	if (!ofnode_valid(mdio_node))
+		return 0;
+
+	for (i = 0; i < RECOVERY_LED_PORTS; i++) {
+		u32 phy_addr;
+
+		if (ofnode_read_u32_index(root, "recovery-link-phy-addrs", i,
+					  &phy_addr) || phy_addr > U8_MAX ||
+		    recovery_node_prop_to_gpio(root, "recovery-green-led-gpios",
+					       i, &ctrl->green[i]) ||
+		    recovery_node_prop_to_gpio(root, "recovery-yellow-led-gpios",
+					       i, &ctrl->yellow[i]))
+			break;
+
+		ctrl->phy_addr[i] = phy_addr;
+		ctrl->port_count++;
+	}
+
+	if (!ctrl->port_count)
+		return 0;
 
 	/* Make sure PHY LED mux is disabled so software can own the lines. */
 	recovery_clrsetbits_le32(RECOVERY_CHIP_SCU_BASE + RECOVERY_REG_GPIO_2ND_I2C_MODE,
@@ -1187,16 +1331,12 @@ static int recovery_led_init(struct recovery_led_ctrl *ctrl)
 				 RECOVERY_GPIO_LAN1_LED0_MODE_MASK |
 				 RECOVERY_GPIO_LAN1_LED1_MODE_MASK, 0);
 
-	for (i = 0; i < RECOVERY_LED_PORTS; i++) {
-		recovery_gpio_prepare_output(recovery_green_led_gpios[i]);
-		recovery_gpio_prepare_output(recovery_yellow_led_gpios[i]);
-		recovery_led_set_pin(recovery_green_led_gpios[i], 0);
-		recovery_led_set_pin(recovery_yellow_led_gpios[i], 0);
+	for (i = 0; i < ctrl->port_count; i++) {
+		recovery_gpio_prepare_output(ctrl->green[i].gpio);
+		recovery_gpio_prepare_output(ctrl->yellow[i].gpio);
+		recovery_led_set_pin(&ctrl->green[i], 0);
+		recovery_led_set_pin(&ctrl->yellow[i], 0);
 	}
-
-	mdio_node = ofnode_path("/soc/switch@1fb58000/mdio");
-	if (!ofnode_valid(mdio_node))
-		return 0;
 
 	ret = uclass_get_device_by_ofnode(UCLASS_MDIO, mdio_node, &ctrl->mdio_dev);
 	if (ret)
@@ -1209,15 +1349,15 @@ static int recovery_led_phy_speed(struct recovery_led_ctrl *ctrl, int idx)
 {
 	int bmcr, bmsr, stat1000, ctrl1000, lpa;
 
-	if (!ctrl->mdio_dev || idx >= ARRAY_SIZE(recovery_led_phy_addrs))
+	if (!ctrl->mdio_dev || idx >= ctrl->port_count)
 		return 0;
 
-	bmsr = dm_mdio_read(ctrl->mdio_dev, recovery_led_phy_addrs[idx],
+	bmsr = dm_mdio_read(ctrl->mdio_dev, ctrl->phy_addr[idx],
 			    MDIO_DEVAD_NONE, MII_BMSR);
 	if (bmsr < 0)
 		return bmsr;
 
-	bmsr = dm_mdio_read(ctrl->mdio_dev, recovery_led_phy_addrs[idx],
+	bmsr = dm_mdio_read(ctrl->mdio_dev, ctrl->phy_addr[idx],
 			    MDIO_DEVAD_NONE, MII_BMSR);
 	if (bmsr < 0)
 		return bmsr;
@@ -1225,7 +1365,7 @@ static int recovery_led_phy_speed(struct recovery_led_ctrl *ctrl, int idx)
 	if (!(bmsr & BMSR_LSTATUS))
 		return 0;
 
-	bmcr = dm_mdio_read(ctrl->mdio_dev, recovery_led_phy_addrs[idx],
+	bmcr = dm_mdio_read(ctrl->mdio_dev, ctrl->phy_addr[idx],
 			    MDIO_DEVAD_NONE, MII_BMCR);
 	if (bmcr < 0)
 		return bmcr;
@@ -1239,9 +1379,9 @@ static int recovery_led_phy_speed(struct recovery_led_ctrl *ctrl, int idx)
 		return SPEED_10;
 	}
 
-	stat1000 = dm_mdio_read(ctrl->mdio_dev, recovery_led_phy_addrs[idx],
+	stat1000 = dm_mdio_read(ctrl->mdio_dev, ctrl->phy_addr[idx],
 				MDIO_DEVAD_NONE, MII_STAT1000);
-	ctrl1000 = dm_mdio_read(ctrl->mdio_dev, recovery_led_phy_addrs[idx],
+	ctrl1000 = dm_mdio_read(ctrl->mdio_dev, ctrl->phy_addr[idx],
 				MDIO_DEVAD_NONE, MII_CTRL1000);
 	if (stat1000 < 0 || ctrl1000 < 0)
 		return stat1000 < 0 ? stat1000 : ctrl1000;
@@ -1252,12 +1392,12 @@ static int recovery_led_phy_speed(struct recovery_led_ctrl *ctrl, int idx)
 			return SPEED_1000;
 	}
 
-	lpa = dm_mdio_read(ctrl->mdio_dev, recovery_led_phy_addrs[idx],
+	lpa = dm_mdio_read(ctrl->mdio_dev, ctrl->phy_addr[idx],
 			   MDIO_DEVAD_NONE, MII_ADVERTISE);
 	if (lpa < 0)
 		return lpa;
 
-	bmsr = dm_mdio_read(ctrl->mdio_dev, recovery_led_phy_addrs[idx],
+	bmsr = dm_mdio_read(ctrl->mdio_dev, ctrl->phy_addr[idx],
 			    MDIO_DEVAD_NONE, MII_LPA);
 	if (bmsr < 0)
 		return bmsr;
@@ -1291,7 +1431,7 @@ static void recovery_led_poll(struct recovery_led_ctrl *ctrl)
 
 	if (poll_phys) {
 		ctrl->last_phy_poll = now;
-		for (i = 0; i < RECOVERY_LED_PORTS; i++) {
+		for (i = 0; i < ctrl->port_count; i++) {
 			int speed = recovery_led_phy_speed(ctrl, i);
 
 			if (speed < 0) {
@@ -1303,7 +1443,7 @@ static void recovery_led_poll(struct recovery_led_ctrl *ctrl)
 			ctrl->speed[i] = speed;
 		}
 
-		if (i == RECOVERY_LED_PORTS)
+		if (i == ctrl->port_count)
 			ctrl->mdio_fault = false;
 	}
 
@@ -1312,10 +1452,10 @@ static void recovery_led_poll(struct recovery_led_ctrl *ctrl)
 	blink_on = !activity ||
 		   ((now / RECOVERY_LED_BLINK_MS) & 1);
 
-	for (i = 0; i < RECOVERY_LED_PORTS; i++) {
-		recovery_led_set_pin(recovery_green_led_gpios[i],
+	for (i = 0; i < ctrl->port_count; i++) {
+		recovery_led_set_pin(&ctrl->green[i],
 				     ctrl->speed[i] == SPEED_1000 && blink_on);
-		recovery_led_set_pin(recovery_yellow_led_gpios[i],
+		recovery_led_set_pin(&ctrl->yellow[i],
 				     (ctrl->speed[i] == SPEED_10 ||
 				      ctrl->speed[i] == SPEED_100) &&
 					     blink_on);
@@ -1325,6 +1465,8 @@ static void recovery_led_poll(struct recovery_led_ctrl *ctrl)
 static const char *recovery_default_target(enum upload_target tgt)
 {
 	switch (tgt) {
+	case TARGET_RECOVERY:
+		return "recovery";
 	case TARGET_FIRMWARE:
 		return "fit";
 	case TARGET_UBOOT:
@@ -1337,6 +1479,8 @@ static const char *recovery_default_target(enum upload_target tgt)
 static const char *recovery_target_env(enum upload_target tgt)
 {
 	switch (tgt) {
+	case TARGET_RECOVERY:
+		return NULL;
 	case TARGET_FIRMWARE:
 		return "recovery_mtd";
 	case TARGET_UBOOT:
@@ -1349,6 +1493,8 @@ static const char *recovery_target_env(enum upload_target tgt)
 static const char *recovery_raw_env(enum upload_target tgt)
 {
 	switch (tgt) {
+	case TARGET_RECOVERY:
+		return NULL;
 	case TARGET_FIRMWARE:
 		return "recovery_dev";
 	case TARGET_UBOOT:
@@ -1361,6 +1507,8 @@ static const char *recovery_raw_env(enum upload_target tgt)
 static const char *recovery_size_env(enum upload_target tgt)
 {
 	switch (tgt) {
+	case TARGET_RECOVERY:
+		return NULL;
 	case TARGET_FIRMWARE:
 		return "recovery_size";
 	case TARGET_UBOOT:
@@ -1373,6 +1521,8 @@ static const char *recovery_size_env(enum upload_target tgt)
 static ulong recovery_raw_offset(enum upload_target tgt)
 {
 	switch (tgt) {
+	case TARGET_RECOVERY:
+		return 0;
 	case TARGET_FIRMWARE:
 		return env_get_hex("recovery_ofs", 0x050000);
 	case TARGET_UBOOT:
@@ -1409,6 +1559,9 @@ static const char *recovery_ubi_part(enum upload_target tgt)
 {
 	const char *part;
 
+	if (recovery_board_is_q1000k())
+		return "ubi";
+
 	if (tgt == TARGET_FIRMWARE && current_ubi_layout)
 		return current_ubi_layout->part;
 
@@ -1444,6 +1597,8 @@ static int recovery_parse_ubi_layout(const char *uri)
 
 	for (i = 0; i < ARRAY_SIZE(recovery_ubi_layouts); i++) {
 		if (!strcmp(query, recovery_ubi_layouts[i].version)) {
+			if (recovery_board_is_q1000k() && i != 0)
+				return -EINVAL;
 			current_ubi_layout = &recovery_ubi_layouts[i];
 			return 0;
 		}
@@ -1489,6 +1644,8 @@ static int recovery_try_ubi_target(enum upload_target tgt,
 	const char *volume = env_get(recovery_target_env(tgt));
 	const char *part = recovery_ubi_part(tgt);
 
+	if (recovery_board_is_q1000k())
+		volume = "fit";
 	if (!volume)
 		volume = recovery_default_target(tgt);
 
@@ -1542,16 +1699,62 @@ static int recovery_try_ubi_target(enum upload_target tgt,
 #endif
 }
 
+/* Inspect geometry only: even a UBI "read" attach may erase/program NAND. */
+static int recovery_q1000k_target(enum upload_target tgt,
+				   struct recovery_target *target)
+{
+	struct mtd_info *mtd;
+
+	if (tgt != TARGET_FIRMWARE && !IS_ENABLED(CONFIG_Q1000K_INSTALLER))
+		return -EPERM;
+	if (tgt == TARGET_UBOOT) {
+		memset(target, 0, sizeof(*target));
+		target->name = "chainloader";
+		target->limit = RECOVERY_UBOOT_SLOT_SIZE;
+		return 0;
+	}
+
+	mtd_probe_devices();
+	mtd = get_mtd_device_nm("ubi");
+	if (IS_ERR_OR_NULL(mtd))
+		return -ENODEV;
+
+	if (!mtd->parent || mtd->parent->parent ||
+	    strcmp(mtd->parent->name, RECOVERY_UBOOT_SLOT_DEFAULT_DEV) ||
+	    mtd->parent->size != RECOVERY_Q1000K_NAND_BYTES ||
+	    mtd->offset != RECOVERY_Q1000K_UBI_OFFSET ||
+	    mtd->size != RECOVERY_Q1000K_UBI_BYTES) {
+		put_mtd_device(mtd);
+		return -EINVAL;
+	}
+
+	target->backend = RECOVERY_BACKEND_UBI;
+	target->name = "fit";
+	if (tgt == TARGET_RECOVERY)
+		target->name = "recovery";
+	target->ubi_part = "ubi";
+	target->mtd = mtd;
+	target->limit = mtd->size;
+	target->ubi_needs_format = true;
+	return 0;
+}
+
 static int recovery_resolve_target(enum upload_target tgt,
 				   struct recovery_target *target)
 {
-	const char *name = env_get(recovery_target_env(tgt));
+	const char *name;
 	const char *raw;
 	struct mtd_info *mtd;
 	ulong ofs;
 
 	memset(target, 0, sizeof(*target));
 
+	if (recovery_board_is_q1000k())
+		return recovery_q1000k_target(tgt, target);
+	if (tgt == TARGET_RECOVERY)
+		return -EOPNOTSUPP;
+
+	name = env_get(recovery_target_env(tgt));
 	if (!name)
 		name = recovery_default_target(tgt);
 
@@ -1605,6 +1808,8 @@ static int recovery_resolve_target(enum upload_target tgt,
 
 	if (!raw) {
 		switch (tgt) {
+		case TARGET_RECOVERY:
+			return -EINVAL;
 		case TARGET_FIRMWARE:
 			raw = "nor0";
 			break;
@@ -1647,6 +1852,25 @@ static void recovery_release_target(struct recovery_target *target)
 	target->mtd = NULL;
 }
 
+static int recovery_validate_xg2010g_uboot_target(
+	const struct recovery_target *target)
+{
+	if (!recovery_board_is_xg2010g())
+		return 0;
+
+	if (!target || target->backend != RECOVERY_BACKEND_MTD || !target->mtd ||
+	    strcmp(target->mtd->name, RECOVERY_UBOOT_SLOT_DEFAULT_DEV) ||
+	    target->ofs != RECOVERY_UBOOT_SLOT_DEFAULT_OFS ||
+	    target->limit != RECOVERY_UBOOT_SLOT_SIZE) {
+		printf("Refusing U-Boot write outside spi-nand0 0x%lx..0x%lx\n",
+		       RECOVERY_UBOOT_SLOT_DEFAULT_OFS,
+		       RECOVERY_UBOOT_SLOT_DEFAULT_OFS + RECOVERY_UBOOT_SLOT_SIZE);
+		return -EPERM;
+	}
+
+	return 0;
+}
+
 static int recovery_force_ubi_rebuild(struct recovery_target *target)
 {
 	struct mtd_info *mtd;
@@ -1685,28 +1909,334 @@ static void recovery_service_runtime(struct recovery_status_led_ctrl *status_led
 	WATCHDOG_RESET();
 }
 
-static int recovery_validate_uboot_slot_image(const void *image, size_t size)
+static int recovery_validate_q1000k_chainloader(const void *fit, size_t size);
+
+static int recovery_prepare_uboot_fit(const void *image, size_t size,
+					const u8 **fit, size_t *fit_size)
 {
 	const u8 *p = image;
 	u32 prefix_magic;
-	u32 fit_magic;
+	u32 candidate_size;
 
-	if (size <= RECOVERY_UBOOT_SLOT_FIT_OFFSET + sizeof(u32)) {
-		printf("U-Boot slot image is too small: %lu bytes\n",
-		       (unsigned long)size);
-		return -EINVAL;
+	if (recovery_board_is_q1000k()) {
+		int ret = recovery_validate_q1000k_chainloader(image, size);
+
+		if (ret)
+			return ret;
+		*fit = image;
+		*fit_size = size;
+		return 0;
 	}
 
+	if (size < sizeof(struct fdt_header))
+		return -EINVAL;
+
+	/* Web uploads may be a bare FIT or a packaged slot. */
+	if (recovery_be32_to_cpu(p) == RECOVERY_FDT_MAGIC) {
+		candidate_size = fdt_totalsize(p);
+		if (candidate_size < sizeof(struct fdt_header) ||
+		candidate_size > size)
+			return -EFBIG;
+		*fit = p;
+		*fit_size = candidate_size;
+		return recovery_validate_fit(p, candidate_size);
+	}
+
+	/* Accept the legacy packaged slot form for web/API compatibility. */
+	if (size <= RECOVERY_UBOOT_SLOT_FIT_OFFSET + sizeof(u32))
+		return -EINVAL;
 	prefix_magic = recovery_be32_to_cpu(p);
-	fit_magic = recovery_be32_to_cpu(p + RECOVERY_UBOOT_SLOT_FIT_OFFSET);
-
 	if (prefix_magic != RECOVERY_IH_MAGIC ||
-	    fit_magic != RECOVERY_FDT_MAGIC) {
-		printf("Invalid U-Boot slot image: magic[0]=0x%08x magic[0x%04x]=0x%08x\n",
-		       prefix_magic, RECOVERY_UBOOT_SLOT_FIT_OFFSET, fit_magic);
-		printf("Expected xr1710g-chainloader-slot.bin, not u-boot.bin or bare .itb\n");
+	    recovery_be32_to_cpu(p + RECOVERY_UBOOT_SLOT_FIT_OFFSET) !=
+		    RECOVERY_FDT_MAGIC) {
+		printf("Invalid XG2010G U-Boot upload: expected FIT at offset 0 or 0x%x\n",
+		       RECOVERY_UBOOT_SLOT_FIT_OFFSET);
 		return -EINVAL;
 	}
+
+	p += RECOVERY_UBOOT_SLOT_FIT_OFFSET;
+	candidate_size = fdt_totalsize(p);
+	if (candidate_size < sizeof(struct fdt_header) ||
+	candidate_size > size - RECOVERY_UBOOT_SLOT_FIT_OFFSET)
+		return -EFBIG;
+	*fit = p;
+	*fit_size = candidate_size;
+	return recovery_validate_fit(p, candidate_size);
+}
+
+/*
+ * Canonicalize the receive buffer to the persistent XG2010G format.  The
+ * stock boot command reads the raw FIT from 0x600000 into fit-base and then
+ * invokes bootm there.  Accept the older dual-entry wrapper as an input
+ * convenience, but never persist its legacy uImage prefix: the chainloader
+ * shim expects the FIT at the beginning of RAM.
+ */
+static int recovery_normalize_uboot_fit(const u8 *fit, size_t fit_size)
+{
+	u8 *dst = recv_base;
+
+	if (!dst || fit_size > RECOVERY_UBOOT_SLOT_SIZE)
+		return -EFBIG;
+
+	if (fit != dst)
+		memmove(dst, fit, fit_size);
+	/* Keep the rest erased when the target is read as a full 1 MiB window. */
+	memset(dst + fit_size, 0xff, RECOVERY_UBOOT_SLOT_SIZE - fit_size);
+
+	return 0;
+}
+
+static bool recovery_ram_range_ok(ulong addr, size_t size)
+{
+	ulong ram_start = (ulong)gd->ram_base;
+	ulong ram_size = (ulong)gd->ram_size;
+	ulong ram_end;
+
+	if (!ram_size || addr < ram_start || ram_size > ULONG_MAX - ram_start)
+		return false;
+	ram_end = ram_start + ram_size;
+
+	return addr <= ram_end && size <= ram_end - addr;
+}
+
+static int recovery_copy_running_chainloader_fit(u8 **imagep, size_t *sizep)
+{
+	const ulong addr = RECOVERY_XG2010G_RUNNING_FIT_ADDR;
+	const u8 *fit = (const u8 *)addr;
+	const u8 *prepared_fit;
+	size_t prepared_size;
+	size_t fit_size;
+	u8 *copy;
+	int ret;
+
+	if (!recovery_board_is_xg2010g()) {
+		printf("Chainloader self-write is only available on XG2010G\n");
+		return -ENODEV;
+	}
+	if (!recovery_ram_range_ok(addr, sizeof(struct fdt_header)) ||
+	    fdt_check_header(fit)) {
+		printf("No running XG2010G chainloader FIT at 0x%08lx\n", addr);
+		return -ENOENT;
+	}
+
+	fit_size = fdt_totalsize(fit);
+	if (fit_size < sizeof(struct fdt_header) ||
+	    fit_size > RECOVERY_UBOOT_SLOT_SIZE ||
+	    !recovery_ram_range_ok(addr, fit_size)) {
+		printf("Running chainloader FIT size %lu is invalid\n",
+		       (ulong)fit_size);
+		return -EFBIG;
+	}
+
+	ret = recovery_prepare_uboot_fit(fit, fit_size, &prepared_fit,
+					 &prepared_size);
+	if (ret)
+		return ret;
+	if (prepared_fit != fit || prepared_size != fit_size)
+		return -ENOEXEC;
+
+	copy = malloc(RECOVERY_UBOOT_SLOT_SIZE);
+	if (!copy)
+		return -ENOMEM;
+	memcpy(copy, fit, fit_size);
+	memset(copy + fit_size, 0xff, RECOVERY_UBOOT_SLOT_SIZE - fit_size);
+
+	ret = recovery_validate_fit(copy, fit_size);
+	if (ret) {
+		free(copy);
+		return ret;
+	}
+
+	*imagep = copy;
+	*sizep = fit_size;
+	printf("Preserved running XG2010G chainloader FIT from 0x%08lx (%lu bytes)\n",
+	       addr, (ulong)fit_size);
+	return 0;
+}
+
+int recovery_validate_q1000k_fit(const void *fit, size_t size)
+{
+	const void *data;
+	void *dtb;
+	size_t len;
+	uintptr_t offset;
+	int images, node, hash, conf, kernel, fdt, ret;
+	u8 type, arch, os, comp;
+
+	if (fdt_check_full(fit, size))
+		return -EINVAL;
+	images = fdt_path_offset(fit, FIT_IMAGES_PATH);
+	if (images < 0)
+		return -EINVAL;
+	fdt_for_each_subnode(node, fit, images) {
+		/* Bound external data before any hash or DTB access. */
+		if (fit_image_get_data(fit, node, &data, &len) || !len ||
+		    (uintptr_t)data < (uintptr_t)fit)
+			return -EINVAL;
+		offset = (uintptr_t)data - (uintptr_t)fit;
+		if (offset > size || len > size - offset)
+			return -EFBIG;
+		if (!recovery_fit_has_hashed_image(fit,
+						 fit_get_name(fit, node, NULL)))
+			return -EBADMSG;
+		fdt_for_each_subnode(hash, fit, node) {
+			if (fdt_getprop(fit, hash, "ignore", NULL))
+				return -EBADMSG;
+		}
+	}
+
+	conf = fit_conf_get_node(fit, NULL);
+	if (conf < 0)
+		return -EINVAL;
+	kernel = fit_conf_get_prop_node(fit, conf, FIT_KERNEL_PROP, IH_PHASE_NONE);
+	fdt = fit_conf_get_prop_node(fit, conf, FIT_FDT_PROP, IH_PHASE_NONE);
+	if (kernel < 0 || fdt < 0 ||
+	    fit_image_get_type(fit, kernel, &type) || type != IH_TYPE_KERNEL ||
+	    fit_image_get_arch(fit, kernel, &arch) || arch != IH_ARCH_ARM64 ||
+	    fit_image_get_os(fit, kernel, &os) || os != IH_OS_LINUX ||
+	    fit_image_get_comp(fit, fdt, &comp) || comp != IH_COMP_NONE ||
+	    fit_image_get_data(fit, fdt, &data, &len))
+		return -EINVAL;
+	/* FIT properties need only 4-byte alignment; libfdt requires 8. */
+	dtb = malloc(len);
+	if (!dtb)
+		return -ENOMEM;
+	memcpy(dtb, data, len);
+	ret = fdt_check_full(dtb, len);
+	if (!ret && fdt_node_check_compatible(dtb, 0, "quantum,q1000k") &&
+	    fdt_node_check_compatible(dtb, 0, "centurylink,q1000k") &&
+	    fdt_node_check_compatible(dtb, 0, "lumen,q1000k"))
+		ret = -EINVAL;
+	free(dtb);
+	if (ret)
+		return ret;
+
+	return fit_all_image_verify(fit) ? 0 : -EBADMSG;
+}
+
+static int recovery_q1000k_fit_layout(const void *fit)
+{
+	const void *data;
+	void *dtb;
+	size_t size;
+	int conf, node, depth = 0, count = 0, ret = -EINVAL;
+
+	conf = fit_conf_get_node(fit, NULL);
+	node = fit_conf_get_prop_node(fit, conf, FIT_FDT_PROP, IH_PHASE_NONE);
+	if (node < 0 || fit_image_get_data(fit, node, &data, &size))
+		return -EINVAL;
+	dtb = malloc(size);
+	if (!dtb)
+		return -ENOMEM;
+	memcpy(dtb, data, size);
+	for (node = 0; node >= 0; node = fdt_next_node(dtb, node, &depth)) {
+		const char *label;
+		const fdt32_t *reg;
+		int len;
+
+		label = fdt_getprop(dtb, node, "label", &len);
+		if (!label || len != 4 || memcmp(label, "ubi", 4))
+			continue;
+		reg = fdt_getprop(dtb, node, "reg", &len);
+		if (fdt_address_cells(dtb, fdt_parent_offset(dtb, node)) != 1 ||
+		    fdt_size_cells(dtb, fdt_parent_offset(dtb, node)) != 1 ||
+		    !reg || len != 8 || fdt32_to_cpu(reg[0]) != Q1000K_UBI_OFFSET ||
+		    fdt32_to_cpu(reg[1]) != Q1000K_UBI_SIZE)
+			goto out;
+		count++;
+	}
+	ret = count == 1 ? 0 : -EINVAL;
+out:
+	free(dtb);
+	return ret;
+}
+
+static int recovery_validate_q1000k_chainloader(const void *fit, size_t size)
+{
+	const fdt32_t *version;
+	int ret, conf, node, images, len, count = 0;
+	ulong load, entry;
+	u8 comp;
+
+	if (size > Q1000K_CHAIN_SIZE || size < sizeof(struct fdt_header))
+		return -EFBIG;
+	ret = recovery_validate_q1000k_fit(fit, size);
+	if (ret || fdt_totalsize(fit) != size)
+		return ret ? ret : -EINVAL;
+	version = fdt_getprop(fit, 0, "q1000k,installer-version", &len);
+	if (!version || len != 4 || fdt32_to_cpu(*version) != 1)
+		return -ENOEXEC;
+	images = fdt_path_offset(fit, FIT_IMAGES_PATH);
+	fdt_for_each_subnode(node, fit, images) {
+		if (!fdt_getprop(fit, node, FIT_DATA_PROP, NULL))
+			return -EINVAL;
+		count++;
+	}
+	conf = fit_conf_get_node(fit, "conf-uboot");
+	if (conf < 0 || conf != fit_conf_get_node(fit, NULL) || count != 2)
+		return -EINVAL;
+	node = fit_conf_get_prop_node(fit, conf, FIT_KERNEL_PROP, IH_PHASE_NONE);
+	if (fit_image_get_load(fit, node, &load) || load != 0x81e00000 ||
+	    fit_image_get_entry(fit, node, &entry) || entry != load ||
+	    fit_image_get_comp(fit, node, &comp) || comp != IH_COMP_NONE)
+		return -EINVAL;
+	node = fit_conf_get_prop_node(fit, conf, FIT_FDT_PROP, IH_PHASE_NONE);
+	if (fit_image_get_load(fit, node, &load) || load != 0x82000000)
+		return -EINVAL;
+	return recovery_q1000k_fit_layout(fit);
+}
+
+static int recovery_validate_firmware_image(const void *image, size_t size)
+{
+	const char *offset_env = env_get("recovery_firmware_fit_offset");
+	const u8 *fit;
+	ulong fit_offset;
+	u32 fit_size;
+	int ret;
+
+	/* Q1000K validation cannot be disabled by changing an environment var. */
+	if (recovery_board_is_q1000k())
+		offset_env = "0";
+
+	/* Legacy UBI recovery images predate an explicit FIT offset contract. */
+	if (!offset_env)
+		return 0;
+
+	fit_offset = recovery_board_is_q1000k() ? 0 :
+		     env_get_hex("recovery_firmware_fit_offset", ULONG_MAX);
+	if (fit_offset == ULONG_MAX || fit_offset > size ||
+	    size - fit_offset < sizeof(struct fdt_header)) {
+		printf("Firmware FIT offset 0x%lx is outside the %lu-byte upload\n",
+		       fit_offset, (unsigned long)size);
+		return -EINVAL;
+	}
+
+	fit = (const u8 *)image + fit_offset;
+	ret = fdt_check_header(fit);
+	if (ret) {
+		printf("Firmware has no valid FIT at offset 0x%lx: %d\n",
+		       fit_offset, ret);
+		return -ENOEXEC;
+	}
+
+	fit_size = fdt_totalsize(fit);
+	if (fit_size < sizeof(struct fdt_header) || fit_size > size - fit_offset) {
+		printf("Firmware FIT size 0x%x exceeds upload data after offset 0x%lx\n",
+		       fit_size, fit_offset);
+		return -EFBIG;
+	}
+
+	if (recovery_board_is_q1000k() && fdt_check_full(fit, size - fit_offset))
+		return -EINVAL;
+
+	ret = fit_check_format(fit, fit_size);
+	if (ret) {
+		printf("Firmware FIT format validation failed: %d\n", ret);
+		return ret;
+	}
+
+	if (recovery_board_is_q1000k())
+		return recovery_validate_q1000k_fit(fit, size - fit_offset);
 
 	return 0;
 }
@@ -1748,6 +2278,31 @@ static void recovery_update_erase_progress(loff_t done)
 {
 	prog_erase_done = done > prog_erase_total ? prog_erase_total : done;
 	prog_done = prog_erase_done + prog_write_done;
+}
+
+static int recovery_validate_q1000k_upload(const void *fit, size_t size)
+{
+	int ret, conf, node;
+	u8 type;
+
+	if (current_target == TARGET_UBOOT)
+		return recovery_validate_q1000k_chainloader(fit, size);
+	ret = recovery_validate_firmware_image(fit, size);
+	if (ret)
+		return ret;
+	if (fdt_getprop(fit, 0, "q1000k,installer-version", NULL))
+		return -ENOEXEC;
+	ret = recovery_q1000k_fit_layout(fit);
+	if (ret)
+		return ret;
+	conf = fit_conf_get_node(fit, NULL);
+	node = fit_conf_get_prop_node(fit, conf,
+		current_target == TARGET_RECOVERY ? FIT_RAMDISK_PROP : FIT_LOADABLE_PROP,
+		IH_PHASE_NONE);
+	if (node < 0 || fit_image_get_type(fit, node, &type) ||
+	    type != (current_target == TARGET_RECOVERY ? IH_TYPE_RAMDISK : IH_TYPE_FILESYSTEM))
+		return -ENOEXEC;
+	return 0;
 }
 
 static int recovery_mtd_mark_bad(struct mtd_info *mtd, loff_t addr)
@@ -1964,6 +2519,70 @@ out:
 	return ret;
 }
 
+static int recovery_install_running_chainloader(
+	struct recovery_status_led_ctrl *status_leds)
+{
+	struct recovery_target target;
+	u8 *image = NULL;
+	size_t image_size = 0;
+	int ret;
+
+	memset(&target, 0, sizeof(target));
+	ret = recovery_copy_running_chainloader_fit(&image, &image_size);
+	if (ret)
+		goto out;
+
+	ret = recovery_resolve_target(TARGET_UBOOT, &target);
+	if (ret) {
+		printf("Cannot resolve the XG2010G chainloader target: %d\n", ret);
+		goto out;
+	}
+	ret = recovery_validate_xg2010g_uboot_target(&target);
+	if (ret)
+		goto out;
+
+	prog_phase = 1;
+	prog_done = 0;
+	prog_erase_done = 0;
+	prog_erase_total = RECOVERY_UBOOT_SLOT_SIZE;
+	prog_write_done = 0;
+	prog_write_total = image_size;
+	prog_total = prog_erase_total + prog_write_total;
+
+	printf("Installing running chainloader into spi-nand0 0x%lx..0x%lx\n",
+	       RECOVERY_UBOOT_SLOT_DEFAULT_OFS,
+	       RECOVERY_UBOOT_SLOT_DEFAULT_OFS + RECOVERY_UBOOT_SLOT_SIZE);
+	ret = recovery_erase_mtd_region(target.mtd, target.ofs,
+					RECOVERY_UBOOT_SLOT_SIZE, status_leds);
+	if (ret)
+		goto out;
+
+	prog_phase = 2;
+	ret = recovery_write_mtd_region(target.mtd, target.ofs,
+					RECOVERY_UBOOT_SLOT_SIZE, image,
+					image_size, true, status_leds);
+	if (ret)
+		goto out;
+
+	prog_phase = 3;
+	printf("Running chainloader installed and read-back verified (%lu bytes)\n",
+	       (ulong)image_size);
+
+out:
+	if (ret)
+		prog_phase = -1;
+	recovery_release_target(&target);
+	free(image);
+	return ret;
+}
+
+int xg2010g_install_running_chainloader(void)
+{
+	struct recovery_status_led_ctrl status_leds = { 0 };
+
+	return recovery_install_running_chainloader(&status_leds);
+}
+
 static bool recovery_preserve_ubi_volume(const char *name)
 {
 	if (!name || !*name)
@@ -2090,10 +2709,29 @@ static int recovery_remove_ubi_volume(const char *name)
 #endif
 }
 
+static size_t recovery_rootfs_data_size(void)
+{
+	const char *value = env_get("rootfs_data_max");
+	unsigned long long parsed;
+	char *end;
+
+	if (!value || !*value)
+		return 0;
+
+	parsed = simple_strtoull(value, &end, 0);
+	if (*end || !parsed || parsed > (size_t)-1) {
+		printf("Ignoring invalid rootfs_data_max '%s'\n", value);
+		return 0;
+	}
+
+	return parsed;
+}
+
 static int recovery_ensure_rootfs_data(struct recovery_target *target)
 {
 #if IS_ENABLED(CONFIG_CMD_UBI) && IS_ENABLED(CONFIG_MTD_UBI)
 	struct ubi_volume_desc *desc;
+	size_t size;
 	int ret;
 
 	if (target->backend != RECOVERY_BACKEND_UBI)
@@ -2108,7 +2746,14 @@ static int recovery_ensure_rootfs_data(struct recovery_target *target)
 		return 0;
 	}
 
-	ret = recovery_create_ubi_volume("rootfs_data", 0, UBI_DYNAMIC_VOLUME);
+	size = recovery_rootfs_data_size();
+	ret = recovery_create_ubi_volume("rootfs_data", size,
+					 UBI_DYNAMIC_VOLUME);
+	if (ret == -ENOSPC && size) {
+		printf("rootfs_data_max does not fit; using all available PEBs\n");
+		ret = recovery_create_ubi_volume("rootfs_data", 0,
+						 UBI_DYNAMIC_VOLUME);
+	}
 	if (ret && ret != -EEXIST) {
 		printf("Failed to create UBI volume 'rootfs_data': %d\n", ret);
 		return ret;
@@ -2588,78 +3233,339 @@ static int recovery_open_custom_response(struct fs_file *file,
 	file->data = page;
 	file->len = total_len;
 	file->index = file->len;
+	file->pextension = NULL;
 	file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
+	return 1;
+}
+
+static int recovery_open_http_error(struct fs_file *file, const char *status,
+				    const char *message)
+{
+	char header[192];
+	char *page;
+	int header_len;
+	int message_len;
+
+	message_len = strlen(message);
+	header_len = snprintf(header, sizeof(header),
+			      "HTTP/1.0 %s\r\n"
+			      "Content-Type: text/plain\r\n"
+			      "Cache-Control: no-store\r\n"
+			      "Content-Length: %d\r\n"
+			      "Connection: close\r\n\r\n",
+			      status, message_len);
+	if (header_len < 0 || header_len >= sizeof(header))
+		return 0;
+
+	page = malloc(header_len + message_len + 1);
+	if (!page)
+		return 0;
+
+	memcpy(page, header, header_len);
+	memcpy(page + header_len, message, message_len);
+	page[header_len + message_len] = '\0';
+	file->data = page;
+	file->len = header_len + message_len;
+	file->index = file->len;
+	file->pextension = NULL;
+	file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
+	return 1;
+}
+
+static bool recovery_uses_raw_firmware_slot(void)
+{
+	const char *raw = env_get("recovery_dev");
+
+	return raw && *raw;
+}
+
+static const char *recovery_board_name(void)
+{
+	if (of_machine_is_compatible("axon,xg2010g") ||
+	    of_machine_is_compatible("econet,xg2010g"))
+		return "XG2010G";
+
+	if (of_machine_is_compatible("quantum,q1000k") ||
+	    of_machine_is_compatible("centurylink,q1000k") ||
+	    of_machine_is_compatible("lumen,q1000k"))
+		return "Q1000K";
+
+	if (of_machine_is_compatible("econet,xr1710g") ||
+	    of_machine_is_compatible("econet,xr1710g-ubi") ||
+	    of_machine_is_compatible("gemtek,xr1710g") ||
+	    of_machine_is_compatible("gemtek,xr1710g-ubi"))
+		return "XR1710G";
+
+	return "AN7581";
+}
+
+static int recovery_open_about_response(struct fs_file *file)
+{
+	char json[384];
+	bool raw_slot = recovery_uses_raw_firmware_slot();
+	bool nand_backup = recovery_board_is_q1000k();
+	const char *layout = raw_slot ? "raw-slot" :
+			     xr1710g_detect_ubi_version();
+	int json_len;
+
+#ifdef U_BOOT_DATE
+	json_len = snprintf(json, sizeof(json),
+			    "{\"u_boot\":\"%s (%s - %s %s)\","
+			    "\"board\":\"%s\",\"firmware_mode\":\"%s\","
+			    "\"detected_layout\":\"%s\","
+			    "\"chainloader_update\":%s,"
+			    "\"nand_backup\":%s,\"nand_backup_bytes\":%llu}\n",
+			    U_BOOT_VERSION, U_BOOT_DATE, U_BOOT_TIME, U_BOOT_TZ,
+			    recovery_board_name(), raw_slot ? "raw" : "ubi",
+			    layout, !recovery_uboot_update_disabled() ? "true" : "false",
+			    nand_backup ? "true" : "false",
+			    nand_backup ? RECOVERY_Q1000K_NAND_BYTES : 0ULL);
+#else
+	json_len = snprintf(json, sizeof(json),
+			    "{\"u_boot\":\"%s\",\"board\":\"%s\","
+			    "\"firmware_mode\":\"%s\","
+			    "\"detected_layout\":\"%s\","
+			    "\"chainloader_update\":%s,"
+			    "\"nand_backup\":%s,\"nand_backup_bytes\":%llu}\n",
+			    U_BOOT_VERSION, recovery_board_name(),
+			    raw_slot ? "raw" : "ubi", layout,
+			    !recovery_uboot_update_disabled() ? "true" : "false",
+			    nand_backup ? "true" : "false",
+			    nand_backup ? RECOVERY_Q1000K_NAND_BYTES : 0ULL);
+#endif
+	if (json_len < 0)
+		return 0;
+	if (json_len >= (int)sizeof(json))
+		json_len = (int)sizeof(json) - 1;
+
+	return recovery_open_custom_response(file, "application/json", json,
+					     json_len);
+}
+
+static int recovery_nand_backup_fill_cache(
+	struct recovery_nand_backup_file *backup)
+{
+	size_t read_len;
+	size_t retlen = 0;
+	int ret;
+
+	if (!backup->bytes_left)
+		return 0;
+
+	read_len = min_t(unsigned long long, backup->bytes_left,
+				 backup->cache_capacity);
+	ret = mtd_read(backup->mtd, backup->next_offset, read_len, &retlen,
+		       backup->cache);
+	if ((ret && ret != -EUCLEAN) || retlen != read_len) {
+		printf("httpd: NAND backup read failed on '%s' at 0x%llx: ret=%d retlen=%lu\n",
+		       backup->mtd->name,
+		       (unsigned long long)backup->next_offset, ret,
+		       (unsigned long)retlen);
+		backup->bytes_left = 0;
+		backup->cache_len = 0;
+		backup->cache_off = 0;
+		return ret ? ret : -EIO;
+	}
+
+	backup->next_offset += read_len;
+	backup->bytes_left -= read_len;
+	backup->cache_len = read_len;
+	backup->cache_off = 0;
+	WATCHDOG_RESET();
+	return 1;
+}
+
+static int recovery_read_nand_backup(struct recovery_nand_backup_file *backup,
+				     char *buffer, int count)
+{
+	int copied = 0;
+
+	while (copied < count) {
+		size_t available;
+		size_t todo;
+		int ret;
+
+		if (backup->http_header_off < backup->http_header_len) {
+			available = backup->http_header_len - backup->http_header_off;
+			todo = min_t(size_t, available, count - copied);
+			memcpy(buffer + copied,
+			       backup->http_header + backup->http_header_off, todo);
+			backup->http_header_off += todo;
+			copied += todo;
+			continue;
+		}
+
+		if (backup->cache_off >= backup->cache_len) {
+			ret = recovery_nand_backup_fill_cache(backup);
+			if (ret <= 0)
+				break;
+		}
+
+		available = backup->cache_len - backup->cache_off;
+		todo = min_t(size_t, available, count - copied);
+		memcpy(buffer + copied, backup->cache + backup->cache_off, todo);
+		backup->cache_off += todo;
+		copied += todo;
+	}
+
+	return copied ? copied : FS_READ_EOF;
+}
+
+static int recovery_open_q1000k_nand_backup(struct fs_file *file)
+{
+	struct recovery_nand_backup_file *backup;
+	struct mtd_info *mtd;
+	int header_len;
+
+	if (!recovery_board_is_q1000k())
+		return recovery_open_http_error(file, "404 Not Found",
+					"NAND backup is unavailable on this board.\n");
+	if (recovery_nand_backup_active)
+		return recovery_open_http_error(file, "409 Conflict",
+					"A NAND backup stream is already active.\n");
+	if (post_ok || flash_request || reboot_request ||
+	    (prog_phase > 0 && prog_phase < 3))
+		return recovery_open_http_error(file, "409 Conflict",
+					"A recovery write operation is active.\n");
+
+	mtd_probe_devices();
+	mtd = get_mtd_device_nm(RECOVERY_UBOOT_SLOT_DEFAULT_DEV);
+	if (IS_ERR_OR_NULL(mtd))
+		return recovery_open_http_error(file, "503 Service Unavailable",
+					"The Q1000K NAND device is unavailable.\n");
+	if (mtd_is_partition(mtd) || mtd->size != RECOVERY_Q1000K_NAND_BYTES) {
+		put_mtd_device(mtd);
+		return recovery_open_http_error(file, "503 Service Unavailable",
+					"The Q1000K full NAND device is unavailable.\n");
+	}
+
+	backup = calloc(1, sizeof(*backup));
+	if (!backup) {
+		put_mtd_device(mtd);
+		return recovery_open_http_error(file, "503 Service Unavailable",
+					"Cannot allocate NAND backup state.\n");
+	}
+
+	backup->cache = memalign(ARCH_DMA_MINALIGN, RECOVERY_NAND_BACKUP_CHUNK);
+	if (!backup->cache) {
+		put_mtd_device(mtd);
+		free(backup);
+		return recovery_open_http_error(file, "503 Service Unavailable",
+					"Cannot allocate NAND backup buffer.\n");
+	}
+
+	header_len = snprintf(backup->http_header, sizeof(backup->http_header),
+			      "HTTP/1.0 200 OK\r\n"
+			      "Content-Type: application/octet-stream\r\n"
+			      "Content-Disposition: attachment; "
+			      "filename=\"q1000k-nand-backup.bin\"\r\n"
+			      "Cache-Control: no-store\r\n"
+			      "Content-Length: %llu\r\n"
+			      "Connection: close\r\n\r\n",
+			      RECOVERY_Q1000K_NAND_BYTES);
+	if (header_len < 0 || header_len >= sizeof(backup->http_header)) {
+		put_mtd_device(mtd);
+		free(backup->cache);
+		free(backup);
+		return 0;
+	}
+
+	backup->magic = RECOVERY_NAND_BACKUP_MAGIC;
+	backup->mtd = mtd;
+	backup->cache_capacity = RECOVERY_NAND_BACKUP_CHUNK;
+	backup->next_offset = 0;
+	backup->bytes_left = RECOVERY_Q1000K_NAND_BYTES;
+	backup->http_header_len = header_len;
+	recovery_nand_backup_active++;
+
+	file->data = NULL;
+	file->len = INT_MAX;
+	file->index = 0;
+	file->pextension = (fs_file_extension *)backup;
+	file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
+	printf("httpd: streaming complete Q1000K NAND backup (%llu bytes)\n",
+	       RECOVERY_Q1000K_NAND_BYTES);
 	return 1;
 }
 
 /* lwIP httpd custom file hooks: serve only dynamic endpoints; static files via fsdata */
 int fs_open_custom(struct fs_file *file, const char *name)
 {
-    const char *p;
-    if (!file || !name)
-        return 0;
+	const char *p;
 
-    /* Normalize leading slash to make httpd default filenames work */
-    p = name;
-    if (*p == '/')
-        p++;
+	if (!file || !name)
+		return 0;
+	memset(file, 0, sizeof(*file));
 
+	/* Normalize leading slash to make httpd default filenames work */
+	p = name;
+	if (*p == '/')
+		p++;
+	if (!strcmp(p, "backup/q1000k-nand.bin"))
+		return recovery_open_q1000k_nand_backup(file);
 
-	    if (!strcmp(p, "status")) {
-        char json[256];
-        int ok = (prog_phase == 3);
-        int err = (prog_phase == -1);
-        int json_len = snprintf(json, sizeof(json),
-                                "{\"in_progress\":%d,\"done\":%u,\"total\":%u,\"erase_done\":%u,\"erase_total\":%u,\"write_done\":%u,\"write_total\":%u,\"ok\":%d,\"error\":%d,\"phase\":%d}\n",
-                                prog_phase > 0 && prog_phase < 3,
-                                (unsigned)prog_done, (unsigned)prog_total,
-                                (unsigned)prog_erase_done, (unsigned)prog_erase_total,
-                                (unsigned)prog_write_done, (unsigned)prog_write_total,
-                                ok, err, prog_phase);
-        if (json_len < 0)
-            return 0;
-        if (json_len >= (int)sizeof(json))
-            json_len = (int)sizeof(json) - 1;
+	if (!strcmp(p, "status")) {
+		char json[256];
+		int ok = prog_phase == 3;
+		int err = prog_phase == -1;
+		int json_len;
+		json_len = snprintf(json, sizeof(json),
+				    "{\"in_progress\":%d,\"done\":%u,"
+				    "\"total\":%u,\"erase_done\":%u,"
+				    "\"erase_total\":%u,\"write_done\":%u,"
+				    "\"write_total\":%u,\"ok\":%d,"
+				    "\"error\":%d,\"phase\":%d}\n",
+				    prog_phase > 0 && prog_phase < 3,
+				    (unsigned int)prog_done,
+				    (unsigned int)prog_total,
+				    (unsigned int)prog_erase_done,
+				    (unsigned int)prog_erase_total,
+				    (unsigned int)prog_write_done,
+				    (unsigned int)prog_write_total,
+				    ok, err, prog_phase);
+		if (json_len < 0)
+			return 0;
+		if (json_len >= (int)sizeof(json))
+			json_len = (int)sizeof(json) - 1;
 
-        return recovery_open_custom_response(file, "application/json",
-					     json, json_len);
-	    }
-	    else if (!strcmp(p, "ok")) {
+		return recovery_open_custom_response(file, "application/json",
+						     json, json_len);
+	}
+
+	if (!strcmp(p, "ok")) {
 		file->data = recovery_page_ok;
 		file->len = sizeof(recovery_page_ok) - 1;
 		file->index = file->len;
+		file->pextension = NULL;
 		file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
 		return 1;
-	    }
-	    else if (!strcmp(p, "about")) {
-	        char json[256];
-	        int json_len =
-#ifdef U_BOOT_DATE
-	            snprintf(json, sizeof(json),
-	                     "{\"u_boot\":\"%s (%s - %s %s)\",\"detected_layout\":\"%s\"}\n",
-	                     U_BOOT_VERSION, U_BOOT_DATE, U_BOOT_TIME, U_BOOT_TZ,
-	                     xr1710g_detect_ubi_version());
-#else
-	            snprintf(json, sizeof(json),
-	                     "{\"u_boot\":\"%s\",\"detected_layout\":\"%s\"}\n",
-	                     U_BOOT_VERSION, xr1710g_detect_ubi_version());
-#endif
-        if (json_len < 0)
-            return 0;
-        if (json_len >= (int)sizeof(json))
-            json_len = (int)sizeof(json) - 1;
+	}
 
-        return recovery_open_custom_response(file, "application/json",
-					     json, json_len);
-    }
-    /* Do not intercept favicon/index/ok/fail: served by fsdata */
-    /* let fsdata handle others */
-    return 0;
+	if (!strcmp(p, "about"))
+		return recovery_open_about_response(file);
+
+	/* Static files are served by fsdata. */
+	return 0;
 }
 
 void fs_close_custom(struct fs_file *file)
 {
-	if (file && file->data && file->data != recovery_page_ok) {
+	struct recovery_nand_backup_file *backup;
+
+	if (!file)
+		return;
+	backup = (struct recovery_nand_backup_file *)file->pextension;
+	if (backup && backup->magic == RECOVERY_NAND_BACKUP_MAGIC) {
+		backup->magic = 0;
+		if (recovery_nand_backup_active)
+			recovery_nand_backup_active--;
+		put_mtd_device(backup->mtd);
+		free(backup->cache);
+		free(backup);
+		file->pextension = NULL;
+		return;
+	}
+	if (file->data && file->data != recovery_page_ok) {
 		free((void *)file->data);
 		file->data = NULL;
 	}
@@ -2667,27 +3573,63 @@ void fs_close_custom(struct fs_file *file)
 
 int fs_read_custom(struct fs_file *file, char *buffer, int count)
 {
-    u32_t left;
-    if (!file || !buffer || count <= 0)
-        return FS_READ_EOF;
-    left = file->len - file->index;
-    if (left <= 0)
-        return FS_READ_EOF;
-    if ((u32_t)count > left)
-        count = left;
-    memcpy(buffer, file->data + file->index, count);
-    file->index += count;
-    return count;
+	struct recovery_nand_backup_file *backup;
+	u32_t left;
+	int read;
+
+	if (!file || !buffer || count <= 0)
+		return FS_READ_EOF;
+	backup = (struct recovery_nand_backup_file *)file->pextension;
+	if (backup && backup->magic == RECOVERY_NAND_BACKUP_MAGIC) {
+		read = recovery_read_nand_backup(backup, buffer, count);
+		if (read < 0 || (!backup->bytes_left &&
+				 backup->cache_off >= backup->cache_len &&
+				 backup->http_header_off >= backup->http_header_len))
+			file->index = file->len;
+		return read;
+	}
+	left = file->len - file->index;
+	if (left <= 0)
+		return FS_READ_EOF;
+	if ((u32_t)count > left)
+		count = left;
+	memcpy(buffer, file->data + file->index, count);
+	file->index += count;
+	return count;
 }
 
 /* Complete custom responses are supplied in file->data by fs_open_custom(). */
 
 /* HTTP POST handlers */
+static int recovery_q1000k_upload_buffer(size_t size, u8 **buffer)
+{
+	ulong start = gd->ram_base;
+	ulong base = start + RECOVERY_Q1000K_UPLOAD_OFFSET;
+	ulong top;
+
+	if (!size || size > RECOVERY_Q1000K_UPLOAD_MAX || base < start ||
+	    !gd->ram_size || gd->ram_size > ULONG_MAX - start ||
+	    gd->start_addr_sp <= start)
+		return -ENOMEM;
+
+	/* All relocated code, malloc, GD and FDT reservations are above SP. */
+	top = min_t(ulong, start + gd->ram_size, gd->start_addr_sp);
+	if (top < RECOVERY_Q1000K_STACK_MARGIN)
+		return -ENOMEM;
+	top -= RECOVERY_Q1000K_STACK_MARGIN;
+	if (base >= top || size > top - base)
+		return -ENOMEM;
+
+	/* Leave ATF, the chainload image and low-memory Ethernet DMA alone. */
+	*buffer = (u8 *)base;
+	return 0;
+}
+
 err_t httpd_post_begin(void *connection, const char *uri, const char *http_request,
                        u16_t http_request_len, int content_len, char *response_uri,
                        u16_t response_uri_len, u8_t *post_auto_wnd)
 {
-    (void)http_request; (void)http_request_len; (void)connection;
+    (void)http_request; (void)http_request_len;
     /*
      * Throttle large uploads explicitly: XR1710G recovery accepts firmware
      * images that are much larger than a typical lwIP POST body and manual
@@ -2696,7 +3638,8 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
     if (post_auto_wnd)
         *post_auto_wnd = 0;
 
-    if (post_ok || flash_request || reboot_request || prog_phase > 0) {
+    if (recovery_nand_backup_active || post_ok || flash_request ||
+        reboot_request || prog_phase > 0) {
         printf("httpd: rejecting upload while recovery flash is busy (phase=%d)\n",
                prog_phase);
         strlcpy(response_uri, "/fail.html", response_uri_len);
@@ -2704,6 +3647,10 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
     }
 
     post_ok = 0;
+    post_connection = NULL;
+    post_validated = false;
+    self_write_request = false;
+    q1000k_uboot_only = false;
     recovery_ubi_attach_error = 0;
     recv_off = 0;
     recv_total = 0;
@@ -2716,7 +3663,32 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
     prog_write_done = 0;
     prog_write_total = 0;
     /* Accept optional query parameters after the target path. */
-    if (!strncmp(uri, "/upload/firmware", 16) &&
+    if ((!strcmp(uri, "/action/self-write") || !strcmp(uri, "/upload/uboot-only") ||
+         (!strncmp(uri, "/upload/uboot", 13) &&
+          (uri[13] == '\0' || uri[13] == '?'))) &&
+        recovery_uboot_update_disabled()) {
+        printf("httpd: chainloader updates are disabled for this board\n");
+        prog_phase = -1;
+        strlcpy(response_uri, "/fail.html", response_uri_len);
+        return ERR_ARG;
+    }
+
+    if (!strcmp(uri, "/action/self-write") && recovery_board_is_q1000k()) {
+        prog_phase = -1;
+        strlcpy(response_uri, "/fail.html", response_uri_len);
+        return ERR_ARG;
+    }
+    if (!strcmp(uri, "/upload/uboot-only") && recovery_board_is_q1000k() &&
+        IS_ENABLED(CONFIG_Q1000K_INSTALLER)) {
+        current_target = TARGET_UBOOT;
+        q1000k_uboot_only = true;
+    } else if (!strcmp(uri, "/upload/recovery") && recovery_board_is_q1000k() &&
+        IS_ENABLED(CONFIG_Q1000K_INSTALLER)) {
+        current_target = TARGET_RECOVERY;
+    } else if (!strcmp(uri, "/action/self-write")) {
+        current_target = TARGET_UBOOT;
+        self_write_request = true;
+    } else if (!strncmp(uri, "/upload/firmware", 16) &&
         (uri[16] == '\0' || uri[16] == '?')) {
         current_target = TARGET_FIRMWARE;
         if (recovery_parse_ubi_layout(uri)) {
@@ -2749,7 +3721,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
         ulong dts_max = recovery_calc_target_max(current_target, &tmpofs);
         ulong max = dts_max ? dts_max : RECOVERY_UPLOAD_MAX;
 
-        if (current_target == TARGET_FIRMWARE)
+        if (current_target == TARGET_FIRMWARE || current_target == TARGET_RECOVERY)
             min = RECOVERY_MIN_FIRMWARE_SIZE;
         else if (current_target == TARGET_UBOOT &&
                  max > RECOVERY_MAX_UBOOT_SIZE)
@@ -2774,11 +3746,17 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 
     recv_total = content_len;
 
-    /*
-     * Pick a stable upload buffer:
-     * recovery_addr -> loadaddr -> CONFIG_SYS_LOAD_ADDR -> RAM fallback.
-     */
-    {
+    if (recovery_board_is_q1000k()) {
+        if (recovery_q1000k_upload_buffer(recv_total, &recv_base)) {
+            prog_phase = -1;
+            strlcpy(response_uri, "/fail.html", response_uri_len);
+            return ERR_MEM;
+        }
+    } else {
+        /*
+         * Pick a stable upload buffer:
+         * recovery_addr -> loadaddr -> CONFIG_SYS_LOAD_ADDR -> RAM fallback.
+         */
         ulong ram_start = (ulong)gd->ram_base;
         ulong ram_end = (ulong)gd->ram_base + (ulong)gd->ram_size;
         ulong base = env_get_hex("recovery_addr", 0);
@@ -2787,12 +3765,15 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
         if (!base)
             base = CONFIG_SYS_LOAD_ADDR;
 
-        /* Keep the buffer inside usable RAM. */
-        if (base < ram_start || base >= ram_end ||
-            recv_total > (ram_end - base)) {
+        /* Keep the buffer inside usable RAM, including normalization space. */
+		/* Leave room for NAND page alignment after FIT normalization. */
+		ulong buffer_need = current_target == TARGET_UBOOT ?
+			RECOVERY_UBOOT_SLOT_SIZE : recv_total;
+		if (base < ram_start || base >= ram_end ||
+		    buffer_need > (ram_end - base) - 0x2000) {
             ulong fallback = ram_start + 0x01000000UL;
             if (fallback >= ram_start && fallback < ram_end &&
-                recv_total <= (ram_end - fallback)) {
+                buffer_need <= (ram_end - fallback)) {
                 base = fallback;
             } else {
                 prog_phase = -1;
@@ -2805,8 +3786,11 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
     }
 
     post_ok = 1;
+    post_connection = connection;
     /* Leave response_uri untouched here so the POST can complete normally. */
-    if (current_target == TARGET_FIRMWARE)
+    if (self_write_request)
+        printf("httpd: accepting XG2010G chainloader self-write request\n");
+    else if (current_target == TARGET_FIRMWARE)
         printf("httpd: accepting %u-byte firmware for UBI %s\n",
                recv_total, current_ubi_layout->version);
     else
@@ -2819,7 +3803,7 @@ err_t httpd_post_receive_data(void *connection, struct pbuf *p)
 	struct pbuf *q;
 	u16_t recved = 0;
 
-	if (!post_ok) {
+	if (!post_ok || connection != post_connection || post_validated) {
 		pbuf_free(p);
 		return ERR_ARG;
 	}
@@ -2846,12 +3830,58 @@ err_t httpd_post_receive_data(void *connection, struct pbuf *p)
 
 void httpd_post_finished(void *connection, char *response_uri, u16_t response_uri_len)
 {
-	bool upload_complete;
+	const u8 *fit_image;
+	u8 *running_fit = NULL;
+	size_t fit_size;
+	bool complete;
+	int ret = 0;
 
-	(void)connection;
+	if (connection != post_connection) {
+		strlcpy(response_uri, "/fail.html", response_uri_len);
+		return;
+	}
+	post_validated = false;
 	printf("httpd: post finished, %u/%u bytes received\n", recv_off, recv_total);
-	upload_complete = post_ok && recv_total && (recv_off >= recv_total);
-	if (upload_complete) {
+	complete = post_ok && recv_total && (recv_off >= recv_total);
+
+	/*
+	 * Validate while httpd can still choose the POST response. flash_image()
+	 * repeats the same checks immediately before touching flash, but waiting
+	 * until then would make a malformed image receive the success page first.
+	 */
+	if (complete) {
+		if (recovery_board_is_q1000k() && IS_ENABLED(CONFIG_Q1000K_INSTALLER)) {
+			ret = recovery_validate_q1000k_upload(recv_base, recv_off);
+		} else if (self_write_request) {
+			if (recv_off != strlen(RECOVERY_XG2010G_INSTALL_TOKEN) ||
+			    memcmp(recv_base, RECOVERY_XG2010G_INSTALL_TOKEN,
+				   strlen(RECOVERY_XG2010G_INSTALL_TOKEN))) {
+				printf("httpd: invalid XG2010G self-write confirmation\n");
+				ret = -EPERM;
+			} else {
+				ret = recovery_copy_running_chainloader_fit(&running_fit,
+								      &fit_size);
+				free(running_fit);
+			}
+		} else if (current_target == TARGET_UBOOT) {
+			ret = recovery_prepare_uboot_fit(recv_base, recv_off,
+							  &fit_image, &fit_size);
+		} else {
+			ret = recovery_validate_firmware_image(recv_base, recv_off);
+		}
+
+		if (ret) {
+			printf("httpd: upload validation failed for target %d: %d\n",
+			       current_target, ret);
+			post_ok = 0;
+			self_write_request = false;
+			prog_phase = -1;
+			complete = false;
+		}
+	}
+
+	if (complete) {
+		post_validated = true;
 		strlcpy(response_uri, "/ok", response_uri_len);
 		printf("httpd: upload received; waiting for POST response ACK\n");
 	} else {
@@ -2864,15 +3894,16 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
 #if LWIP_HTTPD_POST_RESPONSE_ACK
 void httpd_post_response_complete(void *connection, err_t result)
 {
-	(void)connection;
-
-	if (!post_ok || !recv_total || recv_off < recv_total)
+	if (connection != post_connection || !post_validated ||
+	    !post_ok || !recv_total || recv_off != recv_total)
 		return;
+	post_connection = NULL;
 
 	if (result != ERR_OK) {
 		printf("httpd: POST response not acknowledged (%d); flash cancelled\n",
 		       result);
 		post_ok = 0;
+		post_validated = false;
 		prog_phase = -1;
 		return;
 	}
@@ -2886,7 +3917,9 @@ static int flash_image(struct recovery_status_led_ctrl *status_leds)
 {
 	struct recovery_target target;
 	const u8 *image = recv_base;
+	const u8 *fit_image = image;
 	u32 image_size = recv_off;
+	size_t fit_size = image_size;
 	int ret;
 
 	post_ok = 0;
@@ -2898,11 +3931,24 @@ static int flash_image(struct recovery_status_led_ctrl *status_leds)
 	}
 
 	if (current_target == TARGET_UBOOT) {
-		ret = recovery_validate_uboot_slot_image(image, image_size);
+		ret = recovery_prepare_uboot_fit(image, image_size,
+						  &fit_image, &fit_size);
 		if (ret) {
 			prog_phase = -1;
 			return ret;
 		}
+	} else {
+		ret = recovery_validate_firmware_image(image, image_size);
+		if (ret) {
+			prog_phase = -1;
+			return ret;
+		}
+	}
+
+	if (current_target == TARGET_UBOOT) {
+		/* Keep the raw target available for normalization below. */
+		image = fit_image;
+		image_size = fit_size;
 	}
 
 	ret = recovery_resolve_target(current_target, &target);
@@ -2910,6 +3956,32 @@ static int flash_image(struct recovery_status_led_ctrl *status_leds)
 		printf("No flash target found for upload type %d\n", current_target);
 		prog_phase = -1;
 		return ret;
+	}
+
+	if (current_target == TARGET_UBOOT) {
+		ret = recovery_validate_xg2010g_uboot_target(&target);
+		if (ret) {
+			recovery_release_target(&target);
+			prog_phase = -1;
+			return ret;
+		}
+
+		if (RECOVERY_UBOOT_SLOT_SIZE > target.limit) {
+			recovery_release_target(&target);
+			prog_phase = -1;
+			return -EFBIG;
+		}
+
+		ret = recovery_normalize_uboot_fit(fit_image, fit_size);
+		if (ret) {
+			recovery_release_target(&target);
+			prog_phase = -1;
+			return ret;
+		}
+		printf("Normalized U-Boot upload to raw FIT: %u bytes at slot offset 0x0 (window %lu bytes)\n",
+		       (unsigned int)fit_size, RECOVERY_UBOOT_SLOT_SIZE);
+		image = recv_base;
+		image_size = fit_size;
 	}
 
 	if (current_target == TARGET_FIRMWARE &&
@@ -3072,6 +4144,77 @@ static int flash_image(struct recovery_status_led_ctrl *status_leds)
 	return 0;
 }
 
+static void recovery_installer_progress(void *ctx, bool erase, u32 done, u32 total)
+{
+	prog_phase = erase ? 1 : 2;
+	if (erase) {
+		prog_erase_total = total;
+		prog_erase_done = done;
+	} else {
+		prog_write_total = total;
+		prog_write_done = done;
+	}
+	prog_total = prog_erase_total + prog_write_total;
+	prog_done = prog_erase_done + prog_write_done;
+	recovery_service_runtime(ctx);
+}
+
+static int recovery_flash_uploaded_image(struct recovery_status_led_ctrl *leds)
+{
+	struct q1000k_install_plan *plan = NULL;
+	bool installer = IS_ENABLED(CONFIG_Q1000K_INSTALLER) && recovery_board_is_q1000k();
+	int ret = -EPERM;
+
+	if (!post_validated || !post_ok || !recv_total ||
+	    recv_off != recv_total || post_connection)
+		goto out;
+	post_validated = false;
+	if (installer) {
+		ret = recovery_validate_q1000k_upload(recv_base, recv_off);
+		if (ret)
+			goto out;
+		/* No further requests may enter while read-only preflight runs. */
+		prog_phase = 1;
+		if (current_target == TARGET_UBOOT)
+			ret = q1000k_install_prepare(&plan, !q1000k_uboot_only);
+		else
+			ret = q1000k_ubi_check_layout();
+		if (ret)
+			goto out;
+		airoha_snand_set_write_enabled(true);
+		if (current_target == TARGET_UBOOT)
+			ret = q1000k_install_commit(plan, recv_base, recv_off,
+						   recovery_installer_progress, leds);
+		else
+			ret = q1000k_ubi_upload(current_target == TARGET_RECOVERY ? "recovery" : "fit",
+				recv_base, recv_off, recovery_installer_progress, leds);
+		goto out;
+	}
+
+	if (IS_ENABLED(CONFIG_AIROHA_SNFI_NAND_WRITE_GUARD)) {
+		if (!recovery_board_is_q1000k() ||
+		    current_target != TARGET_FIRMWARE)
+			goto out;
+		ret = recovery_validate_firmware_image(recv_base, recv_off);
+		if (ret)
+			goto out;
+	}
+
+	/* One synchronous commit; close the window on every flash return path. */
+	airoha_snand_set_write_enabled(true);
+	ret = flash_image(leds);
+out:
+	airoha_snand_set_write_enabled(false);
+	q1000k_install_release(plan);
+	post_ok = 0;
+	post_validated = false;
+	if (ret)
+		prog_phase = -1;
+	else if (installer)
+		prog_phase = 3;
+	return ret;
+}
+
 int run_http_recovery(void)
 {
 	struct udevice *udev;
@@ -3082,10 +4225,15 @@ int run_http_recovery(void)
 	bool use_status_leds = false;
 	int rc;
 
+	airoha_snand_set_write_enabled(false);
 	recovery_cancel_timeouts();
 	recv_off = recv_total = 0;
 	post_ok = 0;
+	post_connection = NULL;
+	post_validated = false;
 	flash_request = 0;
+	self_write_request = false;
+	q1000k_uboot_only = false;
 	reboot_request = 0;
 	prog_phase = 0;
 	prog_done = 0;
@@ -3152,6 +4300,8 @@ int run_http_recovery(void)
 	}
 	printf("HTTP recovery server listening on http://%s/\n",
 	       ip4addr_ntoa(netif_ip4_addr(netif)));
+	if (IS_ENABLED(CONFIG_AIROHA_ETH))
+		printf("Press d for live Ethernet diagnostics, Ctrl-C to stop.\n");
 	if (use_status_leds)
 		net_lwip_set_recovery_poll_hook(recovery_status_led_service, &status_leds);
 
@@ -3163,6 +4313,8 @@ int run_http_recovery(void)
 				printf("Abort by user\n");
 				break;
 			}
+			if (IS_ENABLED(CONFIG_AIROHA_ETH) && c == 'd')
+				run_command("rtl8261_diag", 0);
 		}
 		/* net_lwip_rx() already runs sys_check_timeouts(). */
 		net_lwip_rx(udev, netif);
@@ -3171,8 +4323,14 @@ int run_http_recovery(void)
 		recovery_led_poll(&leds);
 		if (flash_request) {
 			flash_request = 0;
-			printf("Upload done, flashing...\n");
-			rc = flash_image(&status_leds);
+			if (self_write_request) {
+				printf("Self-write confirmed, installing running chainloader...\n");
+				rc = recovery_install_running_chainloader(&status_leds);
+				self_write_request = false;
+			} else {
+				printf("Upload done, flashing...\n");
+				rc = recovery_flash_uploaded_image(&status_leds);
+			}
 			if (!rc) {
 				printf("Flashing complete. Rebooting in %dms...\n",
 				       REBOOT_DELAY_MS);

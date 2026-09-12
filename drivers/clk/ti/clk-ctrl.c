@@ -12,7 +12,7 @@
 #include <asm/io.h>
 #include <linux/iopoll.h>
 
-#define TRANSITION_TIMEOUT_US	10000
+#define LDELAY	1000000
 
 struct clk_ti_ctrl_offs {
 	fdt_addr_t start;
@@ -39,30 +39,59 @@ static int clk_ti_ctrl_check_offs(struct clk *clk, fdt_addr_t offs)
 
 #define IDLEST_DISABLED		(MODULE_CLKCTRL_IDLEST_DISABLED << MODULE_CLKCTRL_IDLEST_SHIFT)
 #define IDLEST_TRANSITION	(MODULE_CLKCTRL_IDLEST_TRANSITIONING << MODULE_CLKCTRL_IDLEST_SHIFT)
+static inline void wait_for_clk_disable(u32 addr)
+{
+	u32 bound = LDELAY;
+	int val = 0;
+
+	while ((val & MODULE_CLKCTRL_IDLEST_MASK) != IDLEST_DISABLED) {
+		val = readl(addr);
+
+		if (--bound == 0) {
+			printf("Clock disable failed for 0x%x idlest 0x%x\n",
+			       addr, val);
+			return;
+		}
+	}
+}
+
 static int clk_ti_ctrl_disable_clock_module(u32 addr)
 {
-	int val;
-
 	clrsetbits_le32(addr, MODULE_CLKCTRL_MODULEMODE_MASK,
 			MODULE_CLKCTRL_MODULEMODE_SW_DISABLE <<
 			MODULE_CLKCTRL_MODULEMODE_SHIFT);
 
-	return readl_relaxed_poll_timeout(addr, val,
-					  (val & MODULE_CLKCTRL_IDLEST_MASK) == IDLEST_DISABLED,
-					  TRANSITION_TIMEOUT_US);
+	wait_for_clk_disable(addr);
+
+	return 0;
+}
+
+static inline void wait_for_clk_enable(u32 addr)
+{
+	int val = IDLEST_DISABLED;
+	u32 bound = LDELAY;
+
+	while (((val & MODULE_CLKCTRL_IDLEST_MASK) == IDLEST_DISABLED) ||
+	       ((val & MODULE_CLKCTRL_IDLEST_MASK) == IDLEST_TRANSITION)) {
+		val = readl(addr);
+
+		if (--bound == 0) {
+			printf("Clock enable failed for 0x%x idlest 0x%x\n",
+			       addr, val);
+			return;
+		}
+	}
 }
 
 static int clk_ti_ctrl_enable_clock_module(u32 addr)
 {
-	int val;
-
 	clrsetbits_le32(addr, MODULE_CLKCTRL_MODULEMODE_MASK,
 			MODULE_CLKCTRL_MODULEMODE_SW_EXPLICIT_EN <<
 			MODULE_CLKCTRL_MODULEMODE_SHIFT);
-	return readl_relaxed_poll_timeout(addr, val,
-					  ((val & MODULE_CLKCTRL_IDLEST_MASK) != IDLEST_DISABLED) &&
-					  ((val & MODULE_CLKCTRL_IDLEST_MASK) != IDLEST_TRANSITION),
-					  TRANSITION_TIMEOUT_US);
+
+	wait_for_clk_enable(addr);
+
+	return 0;
 }
 
 static int clk_ti_ctrl_disable(struct clk *clk)

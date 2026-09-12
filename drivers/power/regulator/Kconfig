@@ -557,3 +557,53 @@ config DM_REGULATOR_MT6359
 	  MediaTek MT6359 PMIC.
 	  This driver supports the control of different power rails of device
 	  through regulator interface.
+
+config DM_REGULATOR_PMBUS_HELPER
+	bool "Shared regulator helpers for PMBus chip drivers"
+	depends on DM_REGULATOR && PMBUS && DM_I2C
+	help
+	  Provide shared get_value / set_value / get_enable / set_enable
+	  operations for UCLASS_REGULATOR drivers that bind PMBus 1.x
+	  compliant voltage regulators. Per chip drivers
+	  (mps,mpq8785, lltc,ltc3882, ...) consume this helper to avoid
+	  duplicating the LINEAR16 / DIRECT decoder dispatch and the
+	  VOUT_MODE / VOUT_COMMAND / OPERATION transport sequences.
+
+config DM_REGULATOR_PMBUS_GENERIC
+	bool "Generic PMBus 1.x regulator driver (compatible=\"pmbus\")"
+	depends on DM_REGULATOR_PMBUS_HELPER
+	help
+	  Catch all UCLASS_REGULATOR driver bound to compatible = "pmbus".
+	  Auto detects the VOUT numeric format from the chip's VOUT_MODE
+	  register and exposes telemetry plus voltage set / get against
+	  the standard PMBus 1.x command codes. Use this for PMBus
+	  compliant chips that have no per chip driver yet; promote to a
+	  per chip driver only when chip specific quirks (vendor
+	  registers, VID coercion, ADDR pin auto promotion, non standard
+	  m / b / R coefficients) need handling.
+
+config DM_REGULATOR_MPQ8785
+	bool "MPS MPQ8785 / MPM3695 / MPM82504 PMBus voltage regulator"
+	depends on DM_REGULATOR_PMBUS_HELPER
+	help
+	  Driver for the Monolithic Power Systems MPQ8785 family of
+	  digital multiphase voltage regulators with PMBus. Supports
+	  MPM3695, MPM3695-25, MPM82504, and MPQ8785. Adapted from the
+	  Linux drivers/hwmon/pmbus/mpq8785.c reference.
+
+config SANDBOX_PMBUS
+	bool "Sandbox PMBus 1.x chip emulator"
+	depends on SANDBOX && PMBUS && DM_I2C
+	help
+	  Emulate a PMBus 1.x compliant chip behind a sandbox I2C bus so
+	  the PMBus framework (lib/pmbus.c), the generic regulator
+	  (DM_REGULATOR_PMBUS_GENERIC) and the pmbus CLI command can be
+	  exercised by the dm unit tests with no real hardware. Only
+	  useful for testing; say N on real boards.
+
+config DM_REGULATOR_SPACEMIT_P1
+	bool "Enable driver for Spacemit P1 PMIC regulators"
+	depends on DM_REGULATOR && PMIC_SPACEMIT_P1
+	help
+	  Enable implementation of driver-model regulator uclass features
+	  for regulator P1. The driver supports BUCKs, LDOs and SWITCHes.
