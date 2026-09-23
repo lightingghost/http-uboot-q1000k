@@ -6863,6 +6863,7 @@ static int airoha_hw_init(struct udevice *dev, struct airoha_eth *eth)
 static void airoha_switch_recovery_runtime_init(struct airoha_eth *eth)
 {
 	u32 cpu_port_mask = BIT(AIROHA_RECOVERY_SWITCH_CPU_PORT);
+	u32 flood_port_mask = cpu_port_mask | eth->recovery_switch_port_mask;
 
 	if (!eth->switch_regs)
 		return;
@@ -6871,11 +6872,14 @@ static void airoha_switch_recovery_runtime_init(struct airoha_eth *eth)
 	 * This mirrors the recovery-facing switch setup done at probe time, but
 	 * avoids PHY resets and RTL8261 patching. It makes http_recovery
 	 * re-enterable after eth_halt()/eth_init().
+	 * Flood to the recovery LAN ports as well as the CPU: a CPU-only flood
+	 * mask drops CPU-originated DHCP offers and ARP requests. The per-port
+	 * matrices below still isolate the LAN ports from each other.
 	 */
 	airoha_switch_wr(eth, SWITCH_MFC,
-			 FIELD_PREP(SWITCH_BC_FFP, cpu_port_mask) |
-				 FIELD_PREP(SWITCH_UNM_FFP, cpu_port_mask) |
-				 FIELD_PREP(SWITCH_UNU_FFP, cpu_port_mask));
+			 FIELD_PREP(SWITCH_BC_FFP, flood_port_mask) |
+				 FIELD_PREP(SWITCH_UNM_FFP, flood_port_mask) |
+				 FIELD_PREP(SWITCH_UNU_FFP, flood_port_mask));
 	airoha_switch_rmw(eth, SWITCH_CFC, SWITCH_CPU_PMAP,
 			  FIELD_PREP(SWITCH_CPU_PMAP, cpu_port_mask));
 	airoha_switch_rmw(eth, SWITCH_AGC, 0, SWITCH_LOCAL_EN);
@@ -7498,7 +7502,6 @@ static int airoha_eth_recv_qdma(struct airoha_eth *eth, struct airoha_qdma *qdma
 	u16 ppe_entry, length;
 	uchar *packet;
 	int qid;
-	int n;
 
 	qid = 0;
 	q = &qdma->q_rx[qid];
@@ -7507,24 +7510,14 @@ static int airoha_eth_recv_qdma(struct airoha_eth *eth, struct airoha_qdma *qdma
 	dma_unmap_unaligned(virt_to_phys(desc), sizeof(*desc), DMA_FROM_DEVICE);
 
 	desc_ctrl = le32_to_cpu(desc->ctrl);
-	if (!(desc_ctrl & QDMA_DESC_DONE_MASK)) {
-		for (n = 1; n < q->ndesc; n++) {
-			u16 idx = (q->head + n) % q->ndesc;
-
-			desc = &q->desc[idx];
-			dma_unmap_unaligned(virt_to_phys(desc), sizeof(*desc),
-					    DMA_FROM_DEVICE);
-			desc_ctrl = le32_to_cpu(desc->ctrl);
-			if (!(desc_ctrl & QDMA_DESC_DONE_MASK))
-				continue;
-
-			q->head = idx;
-			break;
-		}
-
-		if (n == q->ndesc)
-			return -EAGAIN;
-	}
+	/*
+	 * Consume in ring order after airoha_qdma_sync_rx_head() at startup.
+	 * Even descriptors retain DONE until their odd partner is recycled.
+	 * Scanning the ring while waiting for that partner can rediscover an
+	 * already-consumed packet and repeatedly deliver the same DHCP request.
+	 */
+	if (!(desc_ctrl & QDMA_DESC_DONE_MASK))
+		return -EAGAIN;
 
 	dma_addr = le32_to_cpu(desc->addr);
 	if (dma_addr)
