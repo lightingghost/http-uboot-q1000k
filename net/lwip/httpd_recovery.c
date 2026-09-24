@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
  * Minimal HTTP upload recovery server using lwIP httpd
- * Serves a tiny upload page at / and handles POST to /upload/{firmware|uboot}
+ * Serves an upload page at / for firmware, recovery, chainloader and RAM boot.
  */
 
 #include <dm.h>
@@ -131,6 +131,8 @@ ulong airoha_recovery_get_lan_activity_ms(void);
 #define RECOVERY_Q1000K_UBI_OFFSET     0x00700000ULL
 #define RECOVERY_Q1000K_UBI_BYTES      0x1b600000ULL
 #define RECOVERY_Q1000K_UPLOAD_OFFSET  0x04000000UL
+#define RECOVERY_Q1000K_RAMBOOT_OFFSET 0x09000000UL
+#define RECOVERY_Q1000K_RAMBOOT_MIN_OFFSET (0x00200000UL + CONFIG_SYS_BOOTM_LEN)
 #define RECOVERY_Q1000K_UPLOAD_MAX     0x10000000UL
 #define RECOVERY_Q1000K_STACK_MARGIN   0x00100000UL
 #define RECOVERY_NAND_BACKUP_CHUNK      (256 * 1024UL)
@@ -147,6 +149,7 @@ static int post_ok;
 static void *post_connection;
 static bool post_validated;
 static int flash_request;
+static bool ramboot_request;
 static bool self_write_request;
 static volatile int reboot_request;
 /* Progress for /status polling */
@@ -156,13 +159,15 @@ static volatile u32 prog_erase_total;
 static volatile u32 prog_erase_done;
 static volatile u32 prog_write_total;
 static volatile u32 prog_write_done;
-static volatile int prog_phase; /* 0 idle, 1 erase, 2 write, 3 done, -1 error */
+static volatile int prog_phase; /* 0 idle, 1 erase, 2 write, 3 done, 4 boot, -1 error */
 static unsigned long long prog_erase_volume_base;
 static unsigned long long prog_erase_volume_bytes;
 static struct recovery_status_led_ctrl *prog_status_leds;
 static bool recovery_httpd_started;
 static int recovery_ubi_attach_error;
 static unsigned int recovery_nand_backup_active;
+
+static ulong recovery_q1000k_upload_top(void);
 
 struct recovery_nand_backup_file {
 	u32 magic;
@@ -211,6 +216,7 @@ static void recovery_cancel_timeouts(void)
 {
 	sys_untimeout(reboot_delay_cb, NULL);
 	flash_request = 0;
+	ramboot_request = false;
 	reboot_request = 0;
 }
 
@@ -313,6 +319,7 @@ enum upload_target {
 	TARGET_FIRMWARE = 0,
 	TARGET_UBOOT,
 	TARGET_RECOVERY,
+	TARGET_INITRAMFS,
 };
 static enum upload_target current_target = TARGET_FIRMWARE;
 /* Bound to the accepted POST until its response is acknowledged and committed. */
@@ -2280,6 +2287,43 @@ static void recovery_update_erase_progress(loff_t done)
 	prog_done = prog_erase_done + prog_write_done;
 }
 
+static int recovery_validate_q1000k_initramfs(const void *fit, size_t size)
+{
+	int ret, conf, kernel, ramdisk, images, node;
+	ulong load, entry;
+	u8 type, arch, os;
+
+	ret = recovery_validate_firmware_image(fit, size);
+	if (ret)
+		return ret;
+	if (fdt_getprop(fit, 0, "q1000k,installer-version", NULL))
+		return -ENOEXEC;
+	conf = fit_conf_get_node(fit, NULL);
+	kernel = fit_conf_get_prop_node(fit, conf, FIT_KERNEL_PROP, IH_PHASE_NONE);
+	/* The OpenWrt Linux entry differs from the chainloader's Linux wrapper. */
+	if (fit_image_get_load(fit, kernel, &load) || load != 0x80200000 ||
+	    fit_image_get_entry(fit, kernel, &entry) || entry != load ||
+	    fdt_getprop(fit, conf, FIT_LOADABLE_PROP, NULL))
+		return -ENOEXEC;
+	images = fdt_path_offset(fit, FIT_IMAGES_PATH);
+	fdt_for_each_subnode(node, fit, images) {
+		if (fit_image_get_type(fit, node, &type) ||
+		    (type != IH_TYPE_KERNEL && type != IH_TYPE_FLATDT &&
+		     type != IH_TYPE_RAMDISK))
+			return -ENOEXEC;
+	}
+	/* OpenWrt also builds kernel+DTB FITs with the initramfs inside Linux. */
+	if (!fdt_getprop(fit, conf, FIT_RAMDISK_PROP, NULL))
+		return 0;
+	ramdisk = fit_conf_get_prop_node(fit, conf, FIT_RAMDISK_PROP, IH_PHASE_NONE);
+	if (ramdisk < 0 || fit_image_get_type(fit, ramdisk, &type) ||
+	    type != IH_TYPE_RAMDISK ||
+	    fit_image_get_arch(fit, ramdisk, &arch) || arch != IH_ARCH_ARM64 ||
+	    fit_image_get_os(fit, ramdisk, &os) || os != IH_OS_LINUX)
+		return -ENOEXEC;
+	return 0;
+}
+
 static int recovery_validate_q1000k_upload(const void *fit, size_t size)
 {
 	int ret, conf, node;
@@ -2287,6 +2331,8 @@ static int recovery_validate_q1000k_upload(const void *fit, size_t size)
 
 	if (current_target == TARGET_UBOOT)
 		return recovery_validate_q1000k_chainloader(fit, size);
+	if (current_target == TARGET_INITRAMFS)
+		return recovery_validate_q1000k_initramfs(fit, size);
 	ret = recovery_validate_firmware_image(fit, size);
 	if (ret)
 		return ret;
@@ -3301,9 +3347,10 @@ static const char *recovery_board_name(void)
 
 static int recovery_open_about_response(struct fs_file *file)
 {
-	char json[384];
+	char json[576];
 	bool raw_slot = recovery_uses_raw_firmware_slot();
 	bool nand_backup = recovery_board_is_q1000k();
+	bool ramboot = nand_backup && IS_ENABLED(CONFIG_Q1000K_INSTALLER);
 	const char *layout = raw_slot ? "raw-slot" :
 			     xr1710g_detect_ubi_version();
 	int json_len;
@@ -3314,10 +3361,17 @@ static int recovery_open_about_response(struct fs_file *file)
 			    "\"board\":\"%s\",\"firmware_mode\":\"%s\","
 			    "\"detected_layout\":\"%s\","
 			    "\"chainloader_update\":%s,"
+			    "\"ramboot\":%s,"
+			    "\"ramboot_addr\":\"0x%lx\",\"ramboot_min_addr\":\"0x%lx\","
+			    "\"ramboot_end\":\"0x%lx\","
 			    "\"nand_backup\":%s,\"nand_backup_bytes\":%llu}\n",
 			    U_BOOT_VERSION, U_BOOT_DATE, U_BOOT_TIME, U_BOOT_TZ,
 			    recovery_board_name(), raw_slot ? "raw" : "ubi",
 			    layout, !recovery_uboot_update_disabled() ? "true" : "false",
+			    ramboot ? "true" : "false",
+			    (ulong)gd->ram_base + RECOVERY_Q1000K_RAMBOOT_OFFSET,
+			    (ulong)gd->ram_base + RECOVERY_Q1000K_RAMBOOT_MIN_OFFSET,
+			    recovery_q1000k_upload_top(),
 			    nand_backup ? "true" : "false",
 			    nand_backup ? RECOVERY_Q1000K_NAND_BYTES : 0ULL);
 #else
@@ -3326,10 +3380,17 @@ static int recovery_open_about_response(struct fs_file *file)
 			    "\"firmware_mode\":\"%s\","
 			    "\"detected_layout\":\"%s\","
 			    "\"chainloader_update\":%s,"
+			    "\"ramboot\":%s,"
+			    "\"ramboot_addr\":\"0x%lx\",\"ramboot_min_addr\":\"0x%lx\","
+			    "\"ramboot_end\":\"0x%lx\","
 			    "\"nand_backup\":%s,\"nand_backup_bytes\":%llu}\n",
 			    U_BOOT_VERSION, recovery_board_name(),
 			    raw_slot ? "raw" : "ubi", layout,
 			    !recovery_uboot_update_disabled() ? "true" : "false",
+			    ramboot ? "true" : "false",
+			    (ulong)gd->ram_base + RECOVERY_Q1000K_RAMBOOT_OFFSET,
+			    (ulong)gd->ram_base + RECOVERY_Q1000K_RAMBOOT_MIN_OFFSET,
+			    recovery_q1000k_upload_top(),
 			    nand_backup ? "true" : "false",
 			    nand_backup ? RECOVERY_Q1000K_NAND_BYTES : 0ULL);
 #endif
@@ -3423,7 +3484,7 @@ static int recovery_open_q1000k_nand_backup(struct fs_file *file)
 	if (recovery_nand_backup_active)
 		return recovery_open_http_error(file, "409 Conflict",
 					"A NAND backup stream is already active.\n");
-	if (post_ok || flash_request || reboot_request ||
+	if (post_ok || flash_request || ramboot_request || reboot_request ||
 	    (prog_phase > 0 && prog_phase < 3))
 		return recovery_open_http_error(file, "409 Conflict",
 					"A recovery write operation is active.\n");
@@ -3601,22 +3662,31 @@ int fs_read_custom(struct fs_file *file, char *buffer, int count)
 /* Complete custom responses are supplied in file->data by fs_open_custom(). */
 
 /* HTTP POST handlers */
-static int recovery_q1000k_upload_buffer(size_t size, u8 **buffer)
+static ulong recovery_q1000k_upload_top(void)
 {
 	ulong start = gd->ram_base;
-	ulong base = start + RECOVERY_Q1000K_UPLOAD_OFFSET;
 	ulong top;
 
-	if (!size || size > RECOVERY_Q1000K_UPLOAD_MAX || base < start ||
-	    !gd->ram_size || gd->ram_size > ULONG_MAX - start ||
+	if (!gd->ram_size || gd->ram_size > ULONG_MAX - start ||
 	    gd->start_addr_sp <= start)
-		return -ENOMEM;
+		return 0;
 
 	/* All relocated code, malloc, GD and FDT reservations are above SP. */
 	top = min_t(ulong, start + gd->ram_size, gd->start_addr_sp);
 	if (top < RECOVERY_Q1000K_STACK_MARGIN)
+		return 0;
+	return top - RECOVERY_Q1000K_STACK_MARGIN;
+}
+
+static int recovery_q1000k_upload_buffer(ulong base, size_t size, u8 **buffer)
+{
+	ulong start = gd->ram_base;
+	ulong top = recovery_q1000k_upload_top();
+
+	if (!size || size > RECOVERY_Q1000K_UPLOAD_MAX ||
+	    start > ULONG_MAX - RECOVERY_Q1000K_UPLOAD_OFFSET ||
+	    base < start + RECOVERY_Q1000K_UPLOAD_OFFSET)
 		return -ENOMEM;
-	top -= RECOVERY_Q1000K_STACK_MARGIN;
 	if (base >= top || size > top - base)
 		return -ENOMEM;
 
@@ -3625,10 +3695,51 @@ static int recovery_q1000k_upload_buffer(size_t size, u8 **buffer)
 	return 0;
 }
 
+/* Only an optional addr=0x... parameter is accepted; never evaluate it as code. */
+static int recovery_parse_ramboot_addr(const char *uri, ulong *base)
+{
+	const char *p = strchr(uri, '?');
+	ulong value = 0;
+	unsigned int digit;
+
+	if (gd->ram_base > ULONG_MAX - RECOVERY_Q1000K_RAMBOOT_OFFSET ||
+	    gd->ram_base > ULONG_MAX - RECOVERY_Q1000K_RAMBOOT_MIN_OFFSET)
+		return -EINVAL;
+	*base = gd->ram_base + RECOVERY_Q1000K_RAMBOOT_OFFSET;
+	if (p) {
+		if (strncmp(p, "?addr=0x", 8) && strncmp(p, "?addr=0X", 8))
+			return -EINVAL;
+		p += 8;
+		if (!*p)
+			return -EINVAL;
+		for (; *p; p++) {
+			if (*p >= '0' && *p <= '9')
+				digit = *p - '0';
+			else if (*p >= 'a' && *p <= 'f')
+				digit = *p - 'a' + 10;
+			else if (*p >= 'A' && *p <= 'F')
+				digit = *p - 'A' + 10;
+			else
+				return -EINVAL;
+			if (value > (ULONG_MAX - digit) / 16)
+				return -ERANGE;
+			value = value * 16 + digit;
+		}
+		*base = value;
+	}
+	/* Keep the entire maximum kernel decompression range below the FIT. */
+	if (*base < gd->ram_base + RECOVERY_Q1000K_RAMBOOT_MIN_OFFSET ||
+	    (*base & 0xfff))
+		return -EINVAL;
+	return 0;
+}
+
 err_t httpd_post_begin(void *connection, const char *uri, const char *http_request,
                        u16_t http_request_len, int content_len, char *response_uri,
                        u16_t response_uri_len, u8_t *post_auto_wnd)
 {
+    ulong upload_addr = gd->ram_base + RECOVERY_Q1000K_UPLOAD_OFFSET;
+
     (void)http_request; (void)http_request_len;
     /*
      * Throttle large uploads explicitly: XR1710G recovery accepts firmware
@@ -3638,7 +3749,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
     if (post_auto_wnd)
         *post_auto_wnd = 0;
 
-    if (recovery_nand_backup_active || post_ok || flash_request ||
+    if (recovery_nand_backup_active || post_ok || flash_request || ramboot_request ||
         reboot_request || prog_phase > 0) {
         printf("httpd: rejecting upload while recovery flash is busy (phase=%d)\n",
                prog_phase);
@@ -3682,6 +3793,16 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
         IS_ENABLED(CONFIG_Q1000K_INSTALLER)) {
         current_target = TARGET_UBOOT;
         q1000k_uboot_only = true;
+    } else if (!strncmp(uri, "/upload/initramfs", 17) &&
+        (uri[17] == '\0' || uri[17] == '?') && recovery_board_is_q1000k() &&
+        IS_ENABLED(CONFIG_Q1000K_INSTALLER)) {
+        current_target = TARGET_INITRAMFS;
+        if (recovery_parse_ramboot_addr(uri, &upload_addr)) {
+            printf("httpd: invalid or unsafe RAM boot address\n");
+            prog_phase = -1;
+            strlcpy(response_uri, "/fail.html", response_uri_len);
+            return ERR_ARG;
+        }
     } else if (!strcmp(uri, "/upload/recovery") && recovery_board_is_q1000k() &&
         IS_ENABLED(CONFIG_Q1000K_INSTALLER)) {
         current_target = TARGET_RECOVERY;
@@ -3718,10 +3839,13 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
         ulong min = 0;
         ulong env_max = env_get_hex("recovery_max", 0);
         loff_t tmpofs = 0;
-        ulong dts_max = recovery_calc_target_max(current_target, &tmpofs);
+        /* RAM boot works before installation and never resolves a flash target. */
+        ulong dts_max = current_target == TARGET_INITRAMFS ?
+            RECOVERY_Q1000K_UPLOAD_MAX : recovery_calc_target_max(current_target, &tmpofs);
         ulong max = dts_max ? dts_max : RECOVERY_UPLOAD_MAX;
 
-        if (current_target == TARGET_FIRMWARE || current_target == TARGET_RECOVERY)
+        if (current_target == TARGET_FIRMWARE || current_target == TARGET_RECOVERY ||
+            current_target == TARGET_INITRAMFS)
             min = RECOVERY_MIN_FIRMWARE_SIZE;
         else if (current_target == TARGET_UBOOT &&
                  max > RECOVERY_MAX_UBOOT_SIZE)
@@ -3747,7 +3871,9 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
     recv_total = content_len;
 
     if (recovery_board_is_q1000k()) {
-        if (recovery_q1000k_upload_buffer(recv_total, &recv_base)) {
+        if (recovery_q1000k_upload_buffer(upload_addr, recv_total, &recv_base)) {
+            printf("httpd: upload at 0x%lx (%u bytes) exceeds usable RAM\n",
+                   upload_addr, recv_total);
             prog_phase = -1;
             strlcpy(response_uri, "/fail.html", response_uri_len);
             return ERR_MEM;
@@ -3793,6 +3919,8 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
     else if (current_target == TARGET_FIRMWARE)
         printf("httpd: accepting %u-byte firmware for UBI %s\n",
                recv_total, current_ubi_layout->version);
+    else if (current_target == TARGET_INITRAMFS)
+        printf("httpd: accepting %u-byte initramfs at 0x%lx\n", recv_total, (ulong)recv_base);
     else
         printf("httpd: accepting %u-byte U-Boot image\n", recv_total);
     return ERR_OK;
@@ -3900,7 +4028,7 @@ void httpd_post_response_complete(void *connection, err_t result)
 	post_connection = NULL;
 
 	if (result != ERR_OK) {
-		printf("httpd: POST response not acknowledged (%d); flash cancelled\n",
+		printf("httpd: POST response not acknowledged (%d); operation cancelled\n",
 		       result);
 		post_ok = 0;
 		post_validated = false;
@@ -3908,8 +4036,13 @@ void httpd_post_response_complete(void *connection, err_t result)
 		return;
 	}
 
-	printf("httpd: POST response acknowledged; flashing may start\n");
-	flash_request = 1;
+	if (current_target == TARGET_INITRAMFS) {
+		printf("httpd: POST response acknowledged; RAM boot may start\n");
+		ramboot_request = true;
+	} else {
+		printf("httpd: POST response acknowledged; flashing may start\n");
+		flash_request = 1;
+	}
 }
 #endif
 
@@ -4165,7 +4298,8 @@ static int recovery_flash_uploaded_image(struct recovery_status_led_ctrl *leds)
 	bool installer = IS_ENABLED(CONFIG_Q1000K_INSTALLER) && recovery_board_is_q1000k();
 	int ret = -EPERM;
 
-	if (!post_validated || !post_ok || !recv_total ||
+	if (current_target == TARGET_INITRAMFS ||
+	    !post_validated || !post_ok || !recv_total ||
 	    recv_off != recv_total || post_connection)
 		goto out;
 	post_validated = false;
@@ -4215,6 +4349,52 @@ out:
 	return ret;
 }
 
+/* Consume a single acknowledged RAM upload without ever opening the write gate. */
+static int recovery_prepare_ramboot(void)
+{
+	u8 *checked_base;
+	int ret = -EPERM;
+
+	airoha_snand_set_write_enabled(false);
+	if (!IS_ENABLED(CONFIG_Q1000K_INSTALLER) || !recovery_board_is_q1000k() ||
+	    current_target != TARGET_INITRAMFS || !ramboot_request ||
+	    !post_validated || !post_ok || !recv_total ||
+	    recv_off != recv_total || post_connection)
+		goto out;
+	ret = recovery_q1000k_upload_buffer((ulong)recv_base, recv_total, &checked_base);
+	if (ret)
+		goto out;
+	ret = recovery_validate_q1000k_upload(recv_base, recv_off);
+out:
+	ramboot_request = false;
+	post_ok = 0;
+	post_validated = false;
+	prog_phase = ret ? -1 : 4;
+	return ret;
+}
+
+static int recovery_boot_initramfs(void)
+{
+	const char *args = env_get("bootargs");
+	char *saved_args = args ? strdup(args) : NULL;
+	int ret;
+
+	if (args && !saved_args)
+		return -ENOMEM;
+	/* A kernel without /init must not fall back to the installed NAND root. */
+	ret = env_set("bootargs", "console=ttyS0,115200 earlycon root=/dev/ram0 rdinit=/init");
+	if (!ret) {
+		printf("Q1000K: booting initramfs at 0x%lx; bootloader NAND writes locked\n",
+		       (ulong)recv_base);
+		ret = run_commandf("bootm 0x%lx", (ulong)recv_base);
+	}
+	env_set("bootargs", saved_args);
+	free(saved_args);
+	/* Linux does not return on success. Leave failures at the serial prompt. */
+	printf("Q1000K: RAM boot returned (%d); run http_recovery to retry\n", ret);
+	return ret ? ret : -EIO;
+}
+
 int run_http_recovery(void)
 {
 	struct udevice *udev;
@@ -4223,6 +4403,7 @@ int run_http_recovery(void)
 	struct recovery_status_led_ctrl status_leds;
 	struct recovery_dhcp_server dhcp;
 	bool use_status_leds = false;
+	bool boot_from_ram = false;
 	int rc;
 
 	airoha_snand_set_write_enabled(false);
@@ -4321,6 +4502,14 @@ int run_http_recovery(void)
 		if (use_status_leds)
 			recovery_status_led_poll(&status_leds);
 		recovery_led_poll(&leds);
+		if (ramboot_request) {
+			rc = recovery_prepare_ramboot();
+			if (!rc) {
+				boot_from_ram = true;
+				break;
+			}
+			printf("RAM boot validation failed: %d. Keeping server running.\n", rc);
+		}
 		if (flash_request) {
 			flash_request = 0;
 			if (self_write_request) {
@@ -4357,5 +4546,6 @@ int run_http_recovery(void)
 	recovery_status_led_release(&status_leds);
 	recovery_led_stop(&leds);
 	recovery_led_ctrl_free(&leds);
-	return 0;
+	/* Stop HTTP, DHCP, Ethernet DMA and LED hooks before bootm takes over. */
+	return boot_from_ram ? recovery_boot_initramfs() : 0;
 }

@@ -169,9 +169,11 @@ class NandSafety(unittest.TestCase):
                            if line.startswith('#define SPI_NAND_OP_'))
         macros += '\n#define Q1000K_CHAIN_SIZE 0x100000UL\n' + '\n'.join(line for line in HTTP.splitlines()
                                    if re.match(r'#define RECOVERY_(UPLOAD_MAX|MIN_FIRMWARE_SIZE|MAX_UBOOT_SIZE|NAND_BACKUP_CHUNK|XG2010G_INSTALL_TOKEN|Q1000K_\w+|UBOOT_SLOT_\w+)\b', line))
-        names = ['recovery_q1000k_upload_buffer', 'httpd_post_begin',
+        names = ['recovery_q1000k_upload_top', 'recovery_q1000k_upload_buffer',
+                 'recovery_parse_ramboot_addr', 'httpd_post_begin',
                  'httpd_post_receive_data', 'httpd_post_finished',
                  'httpd_post_response_complete', 'recovery_flash_uploaded_image',
+                 'recovery_prepare_ramboot', 'recovery_boot_initramfs',
                  'recovery_q1000k_target', 'recovery_nand_backup_fill_cache',
                  'recovery_read_nand_backup']
         code = (ROOT / 'test/q1000k/nand_safety_harness.c').read_text()

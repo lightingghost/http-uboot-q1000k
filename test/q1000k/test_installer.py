@@ -64,6 +64,7 @@ static int fit_image_get_type(const void *fit,int node,u8 *out) {
     if(!strcmp(name,"kernel"))*out=IH_TYPE_KERNEL;
     else if(!strcmp(name,"filesystem"))*out=7;
     else if(!strcmp(name,"ramdisk"))*out=3;
+    else if(!strcmp(name,"flat_dt"))*out=8;
     else return -EINVAL;
     return 0;
 }''')
@@ -75,10 +76,11 @@ typedef fdt32_t fdt32_t;
 #define FIT_LOADABLE_PROP "loadables"
 #define IH_TYPE_RAMDISK 3
 #define IH_TYPE_FILESYSTEM 7
+#define IH_TYPE_FLATDT 8
 #define Q1000K_CHAIN_SIZE 0x100000UL
 #define Q1000K_UBI_OFFSET 0x700000UL
 #define Q1000K_UBI_SIZE 0x1b600000UL
-enum upload_target { TARGET_FIRMWARE, TARGET_UBOOT, TARGET_RECOVERY };
+enum upload_target { TARGET_FIRMWARE, TARGET_UBOOT, TARGET_RECOVERY, TARGET_INITRAMFS };
 static enum upload_target current_target;
 static int fit_address(const void *fit,int node,const char *name,ulong *out) {
     int len;const fdt32_t *p=fdt_getprop(fit,node,name,&len);
@@ -91,6 +93,7 @@ static int recovery_validate_firmware_image(const void *fit,size_t size) { retur
 '''
         names = ['recovery_fit_has_hashed_image', 'recovery_validate_q1000k_fit',
                  'recovery_q1000k_fit_layout', 'recovery_validate_q1000k_chainloader',
+                 'recovery_validate_q1000k_initramfs',
                  'recovery_validate_q1000k_upload']
         code = code.replace('/* INSERT PRODUCTION CODE */', extra + '\n'.join(function(HTTP,n) for n in names))
         code = code.replace('if (argc != 2)', 'if (argc != 3)').replace(
@@ -109,6 +112,7 @@ static int recovery_validate_firmware_image(const void *fit,size_t size) { retur
             check(ROOT/'q1000k-chainload-uboot.itb',1,True)
             check(ROOT/'q1000k-chainload-uboot.itb',0,False)
             check(ROOT/'q1000k-chainload-uboot.itb',2,False)
+            check(ROOT/'q1000k-chainload-uboot.itb',3,False)
             (tmp/'kernel.bin').write_bytes(bytes(range(256))*8192)
             (tmp/'rootfs.bin').write_bytes(b'filesystem data'*1000)
             board='/dts-v1/; / { compatible="quantum,q1000k"; partitions { compatible="fixed-partitions"; #address-cells=<1>; #size-cells=<1>; partition@700000 { label="ubi"; reg=<0x700000 SIZE>; }; }; };'
@@ -116,26 +120,42 @@ static int recovery_validate_firmware_image(const void *fit,size_t size) { retur
             for size in ['0x1b600000','0x1b700000']:
                 (tmp/'board.dts').write_text(board.replace('SIZE',size))
                 subprocess.run([str(ROOT/'scripts/dtc/dtc'),'-I','dts','-O','dtb','-o',str(tmp/'board.dtb'),str(tmp/'board.dts')],check=True)
-                for role in ['filesystem','ramdisk']:
+                for role in ['filesystem','ramdisk','embedded']:
                     prop='loadables' if role=='filesystem' else 'ramdisk'
                     its='''/dts-v1/; / { description="test"; images {
- kernel { data=/incbin/("kernel.bin"); type="kernel"; arch="arm64"; os="linux"; compression="none"; hash {algo="sha256";}; };
+ kernel { data=/incbin/("kernel.bin"); type="kernel"; arch="arm64"; os="linux"; load=<0x80200000>; entry=<0x80200000>; compression="none"; hash {algo="sha256";}; };
  fdt { data=/incbin/("board.dtb"); type="flat_dt"; arch="arm64"; compression="none"; hash {algo="sha256";}; };
- rootfs { data=/incbin/("rootfs.bin"); type="ROLE"; arch="arm64"; compression="none"; hash {algo="sha256";}; };
+ rootfs { data=/incbin/("rootfs.bin"); type="ROLE"; arch="arm64"; os="linux"; compression="none"; hash {algo="sha256";}; };
  }; configurations { default="conf"; conf {kernel="kernel"; fdt="fdt"; PROP="rootfs";}; }; };'''
+                    if role=='embedded':
+                        its=re.sub(r' rootfs \{.*?\}; \};\n', '', its)
+                        its=its.replace('PROP="rootfs";', '')
                     (tmp/'image.its').write_text(its.replace('ROLE',role).replace('PROP',prop))
                     for external in [False,True]:
                         subprocess.run([str(ROOT/'tools/mkimage'),*(['-E'] if external else []),'-f','image.its','image.itb'],cwd=tmp,env=tool_env,check=True,stdout=subprocess.DEVNULL)
                         check(tmp/'image.itb',0,size=='0x1b600000' and role=='filesystem')
                         check(tmp/'image.itb',2,size=='0x1b600000' and role=='ramdisk')
                         check(tmp/'image.itb',1,False)
-                        damaged=bytearray((tmp/'image.itb').read_bytes());at=damaged.index(b'filesystem data'*8);damaged[at]^=1
+                        check(tmp/'image.itb',3,role!='filesystem')
+                        valid=(tmp/'image.itb').read_bytes()
+                        damaged=bytearray(valid);at=damaged.index(bytes(range(256))*8);damaged[at]^=1
                         (tmp/'image.itb').write_bytes(damaged)
                         check(tmp/'image.itb',0,False);check(tmp/'image.itb',2,False)
+                        check(tmp/'image.itb',3,False)
+                        (tmp/'image.itb').write_bytes(valid[:len(valid)//2])
+                        check(tmp/'image.itb',3,False)
+            # Reject validly hashed kernel wrappers at the chainloader entry.
+            (tmp/'image.its').write_text(its.replace('0x80200000','0x81e00000'))
+            subprocess.run([str(ROOT/'tools/mkimage'),'-f','image.its','bad-entry.itb'],cwd=tmp,env=tool_env,check=True,stdout=subprocess.DEVNULL)
+            check(tmp/'bad-entry.itb',3,False)
             recovery=os.environ.get('Q1000K_TEST_RECOVERY')
             if recovery:
                 check(Path(recovery),2,os.environ.get("Q1000K_TEST_RECOVERY_EXPECT", "accept")=="accept")
                 check(Path(recovery),0,False)
+                check(Path(recovery),3,True)
+            sysupgrade=os.environ.get('Q1000K_TEST_SYSUPGRADE')
+            if sysupgrade:
+                check(Path(sysupgrade),3,False)
 
 if __name__=='__main__':
     unittest.main(verbosity=2)

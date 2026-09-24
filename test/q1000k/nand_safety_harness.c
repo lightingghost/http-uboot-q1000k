@@ -8,6 +8,7 @@
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+#include <stdarg.h>
 
 typedef uint8_t u8;
 typedef uint8_t u8_t;
@@ -17,6 +18,7 @@ typedef unsigned long ulong;
 typedef int err_t;
 #define CONFIG_AIROHA_SNFI_NAND_WRITE_GUARD 1
 #define CONFIG_Q1000K_INSTALLER TEST_INSTALLER
+#define CONFIG_SYS_BOOTM_LEN 0x08000000UL
 #define IS_ENABLED(x) (x)
 #define BIT(n) (1U << (n))
 #define REG_BLOCK_LOCK 0xa0
@@ -55,14 +57,21 @@ struct recovery_nand_backup_file {
     loff_t next_offset; unsigned long long bytes_left;
     char http_header[256]; size_t http_header_len, http_header_off;
 };
-enum upload_target { TARGET_FIRMWARE, TARGET_UBOOT, TARGET_RECOVERY };
+enum upload_target { TARGET_FIRMWARE, TARGET_UBOOT, TARGET_RECOVERY, TARGET_INITRAMFS };
 #define RECOVERY_BACKEND_UBI 1
 static enum upload_target current_target;
 static struct recovery_ubi_layout layout = { "2.0" }, *current_ubi_layout = &layout;
 static struct { ulong ram_base, ram_size, start_addr_sp; } ram, *gd = &ram;
 static struct mtd_info master = { NULL, "spi-nand0", 0x20000000, 0 };
 static struct mtd_info partition = { &master, "ubi", 0x1b600000, 0x700000 };
-static u8 upload_buffer[1024 * 1024];
+/* Model both staging addresses with an untouched, sparse 79 MiB gap. */
+static struct {
+    u8 flash[1024 * 1024];
+    u8 gap[79 * 1024 * 1024];
+    u8 ramboot[2 * 1024 * 1024];
+} staging __attribute__((aligned(4096)));
+#define upload_buffer staging.flash
+#define ramboot_buffer staging.ramboot
 static u8 *recv_base;
 static u32 recv_off, recv_total;
 static int post_ok, flash_request, reboot_request, prog_phase;
@@ -71,6 +80,10 @@ static unsigned prog_write_done, prog_write_total, recovery_nand_backup_active;
 static int recovery_ubi_attach_error;
 static bool self_write_request, post_validated, airoha_snand_write_enabled;
 static bool q1000k_uboot_only, prepared_ubi;
+static bool ramboot_request;
+static char bootargs[256];
+static bool have_bootargs;
+static int boot_calls, boot_result, boot_env_result;
 static void *post_connection;
 static int validation_result, flash_result, flash_calls, validation_calls;
 static int get_target_calls, read_result;
@@ -92,6 +105,25 @@ static ulong recovery_calc_target_max(enum upload_target target, loff_t *ofs) {
     return recovery_q1000k_target(target, &t) ? 0 : t.limit;
 }
 static ulong env_get_hex(const char *name, ulong fallback) { return fallback; }
+static const char *env_get(const char *name) {
+    assert(!strcmp(name, "bootargs")); return have_bootargs ? bootargs : NULL;
+}
+static int env_set(const char *name, const char *value) {
+    assert(!strcmp(name, "bootargs"));
+    if (value && strstr(value, "rdinit=") && boot_env_result) return boot_env_result;
+    have_bootargs = value != NULL;
+    if (value) snprintf(bootargs, sizeof(bootargs), "%s", value);
+    return 0;
+}
+static int run_commandf(const char *format, ...) {
+    va_list ap;
+    assert(!strcmp(format, "bootm 0x%lx"));
+    va_start(ap, format); assert(va_arg(ap, ulong) == (ulong)recv_base); va_end(ap);
+    assert(!airoha_snand_write_enabled);
+    assert(strstr(bootargs, "rdinit=/init") && strstr(bootargs, "root=/dev/ram0"));
+    assert(!strstr(bootargs, "ubi.block="));
+    boot_calls++; return boot_result;
+}
 static bool recovery_ram_range_ok(ulong addr, size_t len) { return true; }
 static size_t strlcpy(char *dst, const char *src, size_t size) {
     snprintf(dst, size, "%s", src); return strlen(src);
@@ -150,6 +182,7 @@ static void reset_state(void) {
     gd->start_addr_sp = gd->ram_base + 0x1f000000UL;
     post_ok = post_validated = self_write_request = false;
     q1000k_uboot_only = prepared_ubi = false;
+    ramboot_request = false;
     flash_request = reboot_request = prog_phase = 0;
     recv_off = recv_total = 0;
     post_connection = NULL;
@@ -182,13 +215,45 @@ int main(void) {
     /* Both array and OOB programming require the blocked NAND opcodes. */
     reset_state(); check_blocked();
     u8 *buffer;
-    assert(recovery_q1000k_upload_buffer(0x10000000, &buffer) == 0);
+    assert(recovery_q1000k_upload_buffer((ulong)upload_buffer, 0x10000000, &buffer) == 0);
     assert(buffer == upload_buffer);
-    assert(recovery_q1000k_upload_buffer(0x10000001, &buffer) == -ENOMEM);
+    assert(recovery_q1000k_upload_buffer((ulong)upload_buffer, 0x10000001, &buffer) == -ENOMEM);
     gd->start_addr_sp = (ulong)upload_buffer + 0x10000000 + 0x100000 - 1;
-    assert(recovery_q1000k_upload_buffer(0x10000000, &buffer) == -ENOMEM);
+    assert(recovery_q1000k_upload_buffer((ulong)upload_buffer, 0x10000000, &buffer) == -ENOMEM);
     gd->start_addr_sp = 0;
-    assert(recovery_q1000k_upload_buffer(0x100000, &buffer) == -ENOMEM);
+    assert(recovery_q1000k_upload_buffer((ulong)upload_buffer, 0x100000, &buffer) == -ENOMEM);
+    reset_state();
+    /* Exact physical defaults, kernel headroom, alignment, syntax and top bound. */
+    gd->ram_base = 0x80000000UL;
+    gd->start_addr_sp = 0x9f000000UL;
+    ulong address;
+    assert(!recovery_parse_ramboot_addr("/upload/initramfs", &address));
+    assert(address == 0x89000000UL);
+    assert(!recovery_q1000k_upload_buffer(address, 0x10000000, &buffer));
+    assert(!recovery_parse_ramboot_addr("/upload/initramfs?addr=0x90000000", &address));
+    assert(address == 0x90000000UL);
+    assert(!recovery_parse_ramboot_addr("/upload/initramfs?addr=0X88200000", &address));
+    const char *bad_addresses[] = {
+        "", "0x", "0x84000000", "0x80200000", "0x89000001", "0x89000100",
+        "-1", "89000000", "0x10000000000000000", "0x89000000;reset",
+        "0x89000000&addr=0x90000000", "0x89000000%00", "0x89000000 ", "0x8900000g"
+    };
+    char uri[128];
+    for (unsigned i = 0; i < sizeof(bad_addresses)/sizeof(*bad_addresses); i++) {
+        snprintf(uri, sizeof(uri), "/upload/initramfs?addr=%s", bad_addresses[i]);
+        assert(recovery_parse_ramboot_addr(uri, &address) < 0);
+    }
+    assert(recovery_parse_ramboot_addr("/upload/initramfs?foo=0x89000000", &address) < 0);
+    assert(recovery_parse_ramboot_addr("/upload/initramfs?", &address) < 0);
+    ulong top = recovery_q1000k_upload_top();
+    assert(top == 0x9ef00000UL);
+    assert(!recovery_q1000k_upload_buffer(top - 0x100000, 0x100000, &buffer));
+    assert(recovery_q1000k_upload_buffer(top - 0x100000, 0x100001, &buffer) < 0);
+    assert(recovery_q1000k_upload_buffer(0xa0000000UL, 0x100000, &buffer) < 0);
+    assert(recovery_q1000k_upload_buffer(ULONG_MAX, 0x100000, &buffer) < 0);
+    gd->ram_base = ULONG_MAX - 0x1000;
+    assert(recovery_parse_ramboot_addr("/upload/initramfs", &address) < 0);
+    assert(recovery_q1000k_upload_top() == 0);
     reset_state();
     unsigned reads[] = { 0x13, 0x03, 0x0b, 0x3b, 0xbb, 0x6b, 0xeb, 0x9f, 0x0f, 0xff };
     for (unsigned i = 0; i < sizeof(reads)/sizeof(*reads); i++) {
@@ -320,7 +385,97 @@ int main(void) {
         reset_state();board_q1000k=false;
         assert(httpd_post_begin(&owner,"/upload/uboot-only","",0,sizeof(upload_buffer),
                response,sizeof(response),&wnd)==ERR_ARG);
-        board_q1000k=true;
+    board_q1000k=true;
+    }
+
+    /* RAM uploads never resolve a NAND target or enter the write path. */
+    for (int failure = 0; failure < 5; failure++) {
+        reset_state();
+        get_target_calls = 0;
+        struct pbuf data = {NULL, upload_buffer, sizeof(upload_buffer), sizeof(upload_buffer)};
+        assert(httpd_post_begin(&owner, "/upload/initramfs", "", 0, sizeof(upload_buffer),
+               response, sizeof(response), &wnd) == (TEST_INSTALLER ? ERR_OK : ERR_ARG));
+        assert(!get_target_calls);
+        if (!TEST_INSTALLER) continue;
+        assert(current_target == TARGET_INITRAMFS);
+        assert(recv_base == ramboot_buffer);
+        assert(httpd_post_begin(&stranger, "/upload/firmware", "", 0, sizeof(upload_buffer),
+               response, sizeof(response), &wnd) == ERR_ARG);
+        assert(current_target == TARGET_INITRAMFS);
+        if (failure == 1) validation_result = -EBADMSG;
+        if (failure != 2) assert(!httpd_post_receive_data(&owner, &data));
+        httpd_post_finished(&owner, response, sizeof(response));
+        httpd_post_response_complete(&stranger, ERR_OK);
+        assert(!ramboot_request && !flash_request);
+        httpd_post_response_complete(&owner, failure == 3 ? -EIO : ERR_OK);
+        assert(!flash_request); check_blocked();
+        if (failure == 4) validation_result = -EBADMSG;
+        assert((recovery_prepare_ramboot() == 0) == (failure == 0));
+        assert(!ramboot_request && !post_validated);
+        assert(recovery_prepare_ramboot() == -EPERM);
+        assert(!flash_calls); check_blocked();
+    }
+    /* Even an acknowledged RAM upload passed to the flash helper is rejected. */
+    reset_state();
+    current_target = TARGET_INITRAMFS;
+    post_validated = true;
+    post_ok = 1;
+    recv_total = recv_off = sizeof(upload_buffer);
+    assert(recovery_flash_uploaded_image(NULL) == -EPERM);
+    assert(!flash_calls); check_blocked();
+    reset_state(); board_q1000k = false;
+    assert(httpd_post_begin(&owner, "/upload/initramfs", "", 0, sizeof(upload_buffer),
+           response, sizeof(response), &wnd) == ERR_ARG);
+    board_q1000k = true;
+
+    if (TEST_INSTALLER) {
+        /* Custom address reaches receive, validation and boot without resolving NAND. */
+        reset_state(); get_target_calls = 0;
+        snprintf(uri, sizeof(uri), "/upload/initramfs?addr=0x%lx", (ulong)ramboot_buffer + 4096);
+        assert(httpd_post_begin(&owner, uri, "", 0, sizeof(upload_buffer),
+               response, sizeof(response), &wnd) == ERR_OK);
+        assert(recv_base == ramboot_buffer + 4096);
+        snprintf(uri, sizeof(uri), "/upload/initramfs?addr=0x%lx", (ulong)ramboot_buffer);
+        assert(httpd_post_begin(&stranger, uri, "", 0, sizeof(upload_buffer),
+               response, sizeof(response), &wnd) == ERR_ARG);
+        assert(recv_base == ramboot_buffer + 4096);
+        memset(upload_buffer, 0x5a, sizeof(upload_buffer));
+        struct pbuf data = {NULL, upload_buffer, sizeof(upload_buffer), sizeof(upload_buffer)};
+        assert(!httpd_post_receive_data(&owner, &data));
+        assert(!memcmp(recv_base, upload_buffer, sizeof(upload_buffer)));
+        httpd_post_finished(&owner, response, sizeof(response));
+        httpd_post_response_complete(&owner, ERR_OK);
+        assert(!recovery_prepare_ramboot());
+        boot_result = boot_env_result = boot_calls = 0;
+        assert(recovery_boot_initramfs() < 0 && boot_calls == 1);
+        assert(!get_target_calls && !flash_calls); check_blocked();
+        reset_state();
+        assert(httpd_post_begin(&owner, "/upload/initramfs", "", 0, sizeof(upload_buffer),
+               response, sizeof(response), &wnd) == ERR_OK);
+        assert(recv_base == ramboot_buffer); /* Omitted address returns to default. */
+        reset_state(); begin_upload(); assert(recv_base == upload_buffer);
+
+        reset_state();
+        snprintf(uri, sizeof(uri), "/upload/initramfs?addr=0x%lx", recovery_q1000k_upload_top());
+        assert(httpd_post_begin(&owner, uri, "", 0, sizeof(upload_buffer),
+               response, sizeof(response), &wnd) == ERR_MEM);
+        assert(!post_ok && !ramboot_request); check_blocked();
+    }
+
+    /* Handoff uses the staged FIT and restores temporary bootargs on return. */
+    for (int saved = 0; saved < 2; saved++) {
+        for (int failure = 0; failure < 3; failure++) {
+            reset_state(); boot_calls = 0;
+            boot_result = failure == 1 ? -EINVAL : 0;
+            boot_env_result = failure == 2 ? -ENOMEM : 0;
+            const char *original = saved ? "console=ttyS0 root=/dev/fit0 ubi.block=0,fit" : NULL;
+            env_set("bootargs", original);
+            assert(recovery_boot_initramfs() < 0);
+            assert(boot_calls == (failure == 2 ? 0 : 1));
+            assert(have_bootargs == (bool)saved);
+            if (saved) assert(!strcmp(bootargs, original));
+            assert(!flash_calls); check_blocked();
+        }
     }
 
     /* Stream every data byte, including bad-block/reserved addresses, read-only. */

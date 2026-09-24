@@ -23,6 +23,7 @@ and must be a bare FIT at file offset zero. Do not flash `u-boot.bin`,
 - A RAM-bootable FIT containing the raw U-Boot payload and matching Q1000K DTB.
 - HTTP recovery at `http://192.168.255.1` after the chainloader starts.
 - Separate Q1000K firmware, recovery-image, and chainloader update flows.
+- Temporary HTTP boot of Q1000K OpenWrt initramfs FIT images from RAM.
 - A guarded, explicit first-install operation that prepares the fixed UBI
   range only after confirmation.
 
@@ -100,6 +101,9 @@ connected to the recovery port. The recovery page distinguishes these actions:
   and resets `rootfs_data` while preserving the factory and recovery volumes.
 - **Recovery Image** accepts a Q1000K `*-initramfs-recovery.itb`, replaces the
   recovery volume, and resets `rootfs_data`.
+- **Boot from RAM** accepts a Q1000K `*-initramfs-recovery.itb` and boots it
+  directly from memory. This works before installation; the bootloader does
+  not attach UBI, write NAND, or save environment changes for this action.
 - **Update U-Boot only** writes and verifies only the 1 MiB chainloader slot;
   it preserves the existing UBI volumes and vendor environment.
 - **Install U-Boot and prepare UBI** is a deliberate first-install action. It
@@ -109,6 +113,32 @@ connected to the recovery port. The recovery page distinguishes these actions:
 
 Use only images built for the fixed Q1000K layout. An upload for another
 AN7581 device, a raw U-Boot binary, or an oversized FIT is rejected by design.
+
+### Temporary initramfs boot
+
+Select **Boot from RAM**, choose the Q1000K initramfs `.itb`, and click
+**Upload and Boot**. **RAM upload address** defaults to `0x89000000` and can
+be changed for the current upload. Use a hexadecimal address aligned to
+4 KiB. The page displays the usable RAM limit and rejects images that do not
+fit at the selected address. The server independently enforces these checks.
+The image may contain an embedded initramfs or a separate
+FIT ramdisk. Sysupgrade images and chainloader images are rejected. Uploads
+must be 1–256 MiB and fit in the available staging memory.
+Addresses must also be above the full kernel decompression area: the minimum
+is `0x88200000` with the current 128 MiB decompression limit. This is the FIT
+upload address; Linux still loads at `0x80200000`. The choice is not saved to
+flash. Firmware and recovery-image flashing continue to stage at `0x84000000`.
+
+After validation and acknowledgement of the upload response, recovery stops
+HTTP, DHCP and Ethernet, then boots Linux. The page shows **Boot requested**;
+follow the serial console for the actual boot result. Linux uses the network
+configuration in the initramfs, which may differ from `192.168.255.1`.
+Restarting returns to the existing boot setup. The running Linux image controls
+its own storage access; the bootloader's NAND write guard does not protect
+against writes performed by Linux.
+
+If `bootm` returns, the serial console reports the error. Run `http_recovery`
+to retry. No persistent recovery volume is required or created.
 
 ## Regression tests
 

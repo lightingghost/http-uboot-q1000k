@@ -35,6 +35,15 @@ enforces the 1 MiB FIT limit, extracts and compares both payloads, and prints
 the final SHA-256. A failed packaging check leaves an existing output file
 intact. No OpenWrt packaging helper, stock NAND dump or shim is required.
 
+The default configuration omits the UBIFS, FAT and EXT4 filesystem readers,
+MMC/SD support, standard boot scanning and its boot methods, and SPI-NOR
+drivers and ``sf`` commands to leave room in the 1 MiB chainloader window.
+Link-time optimization (LTO) is enabled to reduce code size across modules.
+UBI volume management, SPI-NAND, HTTP recovery, initramfs RAM boot and TFTP
+remain enabled. Installation writes FIT images directly to UBI volumes, and
+``q1000k_boot`` reads them back without mounting a filesystem. OpenWrt's
+filesystem support is independent of these U-Boot options.
+
 Packaging the vendor-bootable chainloader FIT
 ----------------------------------------------
 
@@ -232,6 +241,40 @@ A kernel which successfully starts but later hangs cannot trigger this fallback.
 The chainloader environment lives only in RAM. Reserved ``ubootenv`` and
 ``ubootenv2`` volumes match the reference layout but are not automatically
 loaded or saved. This avoids writable UBI attachment for settings at startup.
+
+The **Boot from RAM** page posts a Q1000K initramfs FIT to
+``/upload/initramfs?addr=0x89000000``. This action works before installation and bypasses
+flash target resolution, UBI preflight and all write paths. It uses the
+bounded 256 MiB upload buffer, defaulting to ``0x89000000``. The web page's
+**RAM upload address** field selects a different buffer for the current POST;
+omitting the query parameter selects the default. Only one ``addr=0x...``
+parameter is accepted, with strict hexadecimal parsing and 4 KiB alignment.
+The full upload must fit below both the end of DRAM and the relocated
+U-Boot stack minus the 1 MiB margin. Its start must be at least
+``0x80200000 + CONFIG_SYS_BOOTM_LEN`` (currently ``0x88200000``), leaving the
+entire maximum kernel decompression area clear. ``/about`` reports the
+default, minimum and usable end addresses for the form. The selected address
+is bound to the upload; concurrent requests cannot replace it. Nothing is
+saved to the environment or flash. Ordinary flash uploads still use
+``0x84000000``. FIT bounds, payload hashes,
+board compatibility and the Linux load/entry address ``0x80200000`` are
+checked before replying and again after the owning POST response is
+acknowledged. Failed, partial or unacknowledged uploads cannot request boot.
+
+Both an embedded initramfs (kernel and DTB) and a separate FIT ramdisk are
+accepted. FITs with filesystem images, loadables or an installer marker are
+rejected. Embedded initramfs contents cannot be established from FIT metadata;
+the caller must supply a kernel built with a working ``/init``. Temporary
+``root=/dev/ram0 rdinit=/init`` boot arguments prevent fallback to the
+installed NAND root. The fixed UBI layout check used for persistent uploads
+does not apply to this temporary boot.
+
+The recovery loop shuts down HTTP, DHCP, network callbacks, Ethernet and
+LEDs before invoking ``bootm``. A returned boot attempt restores the previous
+boot arguments and leaves an error at the serial console; ``http_recovery``
+starts a new session. The web response confirms image acceptance, not a
+successful Linux boot. The bootloader never opens the NAND write gate for
+this operation; once running, Linux controls its own NAND/UBI access.
 
 ``CONFIG_AIROHA_SNFI_NAND_WRITE_GUARD`` blocks NAND write-enable, program-load,
 program-execute and erase commands at the controller from startup, including

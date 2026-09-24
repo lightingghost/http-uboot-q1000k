@@ -346,6 +346,7 @@ button,input,select{font:inherit;letter-spacing:0}
     <nav class='nav' aria-label='Recovery target'>
       <button class='nav-button active' type='button' data-target='firmware' aria-current='page'><span class='nav-dot'></span>Firmware Recovery</button>
       <button class='nav-button' id='recovery-nav-button' type='button' data-target='recovery' hidden><span class='nav-dot'></span>Recovery Image</button>
+      <button class='nav-button' id='ramboot-nav-button' type='button' data-target='initramfs' hidden><span class='nav-dot'></span>Boot from RAM</button>
       <button class='nav-button' id='uboot-nav-button' type='button' data-target='uboot' hidden><span class='nav-dot'></span>Update U-Boot</button>
       <button class='nav-button' id='nand-backup-nav-button' type='button' data-target='backup' hidden><span class='nav-dot'></span>NAND Backup</button>
     </nav>
@@ -387,6 +388,12 @@ button,input,select{font:inherit;letter-spacing:0}
               <option value='1.0'>UBI 1.0 - 503 MiB (legacy)</option>
             </select>
             <p class='layout-help' id='layout-help'></p>
+          </div>
+
+          <div class='layout-block' id='ramboot-address-block' hidden>
+            <label class='layout-label' for='ramboot-address'>RAM upload address</label>
+            <input class='layout-select' id='ramboot-address' type='text' value='0x89000000' spellcheck='false' autocomplete='off' aria-describedby='ramboot-address-help'>
+            <p class='layout-help' id='ramboot-address-help'>Default: 0x89000000. Enter a hexadecimal address aligned to 4 KiB.</p>
           </div>
 
           <div class='file-block'>
@@ -462,6 +469,9 @@ var fixedUbiLayout=false;
 var selfWriteAvailable=false;
 var chainloaderUpdateAvailable=false;
 var q1000kInstaller=false;
+var rambootAvailable=false;
+var rambootMin=0x88200000;
+var rambootEnd=0xa0000000;
 var ubootMode='update';
 var nandBackupAvailable=false;
 var selectedFile=null;
@@ -471,6 +481,16 @@ var pollEpoch=0;
 var pollOutcome=0;
 
 var profiles={
+  initramfs:{
+    title:'Boot from RAM',
+    copy:'Upload a Q1000K OpenWrt initramfs FIT and start a temporary Linux session.',
+    target:'RAM',
+    scope:'Validate the image and boot it directly from memory',
+    preserve:'The bootloader does not write firmware, settings or U-Boot to flash',
+    help:'Q1000K initramfs-recovery FIT (.itb), 1–256 MiB; sysupgrade images are not supported',
+    action:'Upload and Boot',
+    notices:['Use an initramfs built for Q1000K, with its root filesystem embedded in the kernel or included as a ramdisk.','Installation is not required. Restarting returns to your existing boot setup.','The recovery page disconnects when Linux starts. Follow the serial console or use the initramfs network address.']
+  },
   backup:{
     title:'NAND Backup',
     copy:'Save a complete image of the NAND data area. Backup uses read-only access and does not change storage.'
@@ -518,6 +538,9 @@ var layoutBlock=document.getElementById('layout-block');
 var layoutSelect=document.getElementById('layout-select');
 var layoutHelp=document.getElementById('layout-help');
 var ubootModeSelect=document.getElementById('uboot-mode');
+var rambootAddress=document.getElementById('ramboot-address');
+var rambootAddressHelp=document.getElementById('ramboot-address-help');
+rambootAddress.value='0x89000000';
 var state=document.getElementById('state');
 var statusMessage=document.getElementById('status-message');
 
@@ -543,7 +566,7 @@ function updateLayout(){
 }
 
 function setTarget(target){
-  if(busy||!profiles[target]||(target==='uboot'&&!chainloaderUpdateAvailable)||(target==='recovery'&&!q1000kInstaller)||(target==='backup'&&!nandBackupAvailable))return;
+  if(busy||!profiles[target]||(target==='uboot'&&!chainloaderUpdateAvailable)||(target==='recovery'&&!q1000kInstaller)||(target==='initramfs'&&!rambootAvailable)||(target==='backup'&&!nandBackupAvailable))return;
   activeTarget=target;
   var p=profile();
   var buttons=document.querySelectorAll('.nav-button');
@@ -556,6 +579,7 @@ function setTarget(target){
   document.getElementById('page-title').textContent=p.title;
   document.getElementById('page-copy').textContent=p.copy;
   document.getElementById('flash-page').hidden=target==='backup';
+  document.getElementById('ramboot-address-block').hidden=target!=='initramfs';
   nandBackupSection.hidden=target!=='backup';
   if(target==='backup'){
     uploadButton.disabled=true;
@@ -568,6 +592,10 @@ function setTarget(target){
   uploadButton.textContent=p.action;
   selfWriteButton.hidden=target!=='uboot'||!selfWriteAvailable;
   document.getElementById('uboot-mode-block').hidden=target!=='uboot'||!q1000kInstaller;
+  document.getElementById('row-erase').hidden=target==='initramfs';
+  document.getElementById('row-write').hidden=target==='initramfs';
+  document.getElementById('layout-status-label').hidden=target==='initramfs';
+  document.getElementById('detected-layout').hidden=target==='initramfs';
   ubootModeSelect.value=ubootMode;
   var list=document.getElementById('notice-list');
   list.textContent='';
@@ -587,15 +615,38 @@ function formatBytes(bytes){
   return(bytes/(1024*1024)).toFixed(1)+' MiB';
 }
 
+function rambootAddressError(){
+  var text=rambootAddress.value.trim();
+  if(!/^0x[0-9a-f]{1,8}$/i.test(text))return'Enter a hexadecimal RAM address, such as 0x89000000.';
+  var address=Number(text);
+  if(address%4096!==0)return'Align the address to 4 KiB (the last three hex digits must be 000).';
+  if(address<rambootMin||address>=rambootEnd)return'Choose an address from 0x'+rambootMin.toString(16)+' to below 0x'+rambootEnd.toString(16)+'.';
+  if(selectedFile&&selectedFile.size>rambootEnd-address)return'The image does not fit at this address. Choose a lower address or a smaller image.';
+  return'';
+}
+
+function updateRambootAddress(){
+  var error=rambootAddressError();
+  rambootAddress.setAttribute('aria-invalid',error?'true':'false');
+  rambootAddressHelp.textContent=error||'Default: 0x89000000. The full image must fit below 0x'+rambootEnd.toString(16)+'. This changes the upload buffer for this session.';
+  rambootAddressHelp.className='layout-help'+(error?' warning':'');
+  document.getElementById('target-value').textContent='RAM at '+rambootAddress.value.trim();
+}
+
 function fileError(){
   if(!selectedFile)return'';
+  if(activeTarget==='initramfs'&&rambootAddressError())return rambootAddressError();
   if(activeTarget!=='uboot'&&selectedFile.size<1024*1024)return'Firmware images must be at least 1 MiB.';
   if(activeTarget==='uboot'&&selectedFile.size>1024*1024)return'U-Boot images must not exceed 1 MiB.';
+  if(activeTarget==='initramfs'&&selectedFile.size>256*1024*1024)return'Initramfs images must not exceed 256 MiB.';
+  if(activeTarget==='initramfs'&&!/\.itb$/i.test(selectedFile.name))return'Select an initramfs FIT (.itb).';
+  if(activeTarget==='initramfs'&&/sysupgrade/i.test(selectedFile.name))return'Select an initramfs image, not a sysupgrade image.';
   return'';
 }
 
 function validateFile(){
   if(activeTarget==='backup'){uploadButton.disabled=true;return;}
+  if(activeTarget==='initramfs')updateRambootAddress();
   var error=fileError();
   fileHelp.className='file-help';
   if(!selectedFile){
@@ -626,6 +677,7 @@ function setBusy(value){
 	  for(var i=0;i<buttons.length;i++)buttons[i].disabled=value;
   layoutSelect.disabled=value;
   ubootModeSelect.disabled=value;
+  rambootAddress.disabled=value;
   selfWriteButton.disabled=value;
   nandBackupButton.disabled=value;
   validateFile();
@@ -711,6 +763,7 @@ function startStatusPolling(epoch,label,message){
 
 async function upload(){
   if(busy||activeTarget==='backup'||!selectedFile||fileError())return;
+  var rambootAddressValue=rambootAddress.value.trim();
   if(q1000kInstaller&&activeTarget==='uboot'){
     var confirmation=ubootMode==='install'?
       'Install this chainloader, erase all firmware and settings in the 438 MiB UBI partition, and change vendor bootcmd? After reboot, upload OpenWrt firmware.':
@@ -748,14 +801,24 @@ async function upload(){
   });
   xhr.addEventListener('load',function(){
     if(xhr.status<200||xhr.status>=300){
-      setState('Rejected','error','The server rejected this image. Check the file and try again.');
       setBusy(false);
+      setState('Rejected','error',activeTarget==='initramfs'?'The server rejected the image or RAM address. Check the serial console for details.':'The server rejected this image. Check the file and try again.');
       return;
     }
     setProgress('upload',100,'complete');
+    if(activeTarget==='initramfs'){
+      pollOutcome=1;
+      setState('Boot requested','working','Image accepted. The device will leave recovery to boot Linux. Check the serial console or the initramfs network address.');
+      return;
+    }
     startStatusPolling(pollEpoch,'Processing','Upload complete. Waiting for erase and write operations.');
   });
   xhr.addEventListener('error',function(){
+    if(activeTarget==='initramfs'){
+      setBusy(false);
+      setState('Unconfirmed','error','RAM boot was not confirmed. Check the serial console before retrying; the device may have started Linux.');
+      return;
+    }
     if(uploadSent){
       setProgress('upload',100,'complete');
       startStatusPolling(pollEpoch,'Checking Status','Upload was sent, but confirmation was interrupted. Do not power off or retry.');
@@ -765,6 +828,7 @@ async function upload(){
     setBusy(false);
   });
 	  var uploadUri='/upload/'+activeTarget;
+	  if(activeTarget==='initramfs')uploadUri+='?addr='+encodeURIComponent(rambootAddressValue);
 	  if(q1000kInstaller&&activeTarget==='uboot'&&ubootMode==='update')uploadUri='/upload/uboot-only';
 	  if(activeTarget==='firmware'&&!rawFirmware&&!fixedUbiLayout)uploadUri+='?layout='+encodeURIComponent(selectedLayout);
 	  xhr.open('POST',uploadUri,true);
@@ -820,6 +884,7 @@ for(var i=0;i<navButtons.length;i++){
 }
 chooseButton.addEventListener('click',function(){if(!busy)fileInput.click()});
 fileInput.addEventListener('change',function(){selectedFile=this.files[0]||null;validateFile()});
+rambootAddress.addEventListener('input',function(){if(!busy)validateFile()});
 layoutSelect.addEventListener('change',function(){
   if(busy)return;
   selectedLayout=layouts[this.value]?this.value:'2.0';
@@ -879,6 +944,8 @@ function applyQ1000kProfile(){
 (function(){
   if(location.protocol!=='file:')return;
   chainloaderUpdateAvailable=true;
+  rambootAvailable=true;
+  document.getElementById('ramboot-nav-button').hidden=false;
   ubootNavButton.hidden=false;
   applyQ1000kProfile();
   nandBackupCopy.textContent='Preview: the Q1000K recovery server enables this control and streams the complete NAND data area.';
@@ -897,6 +964,13 @@ function applyQ1000kProfile(){
 	      chainloaderUpdateAvailable=!!data.chainloader_update;
 	      selfWriteAvailable=chainloaderUpdateAvailable&&data.board==='XG2010G';
 	      ubootNavButton.hidden=!chainloaderUpdateAvailable;
+	      rambootAvailable=data.board==='Q1000K'&&!!data.ramboot;
+	      document.getElementById('ramboot-nav-button').hidden=!rambootAvailable;
+	      if(rambootAvailable&&data.ramboot_addr&&data.ramboot_min_addr&&data.ramboot_end){
+	        rambootAddress.value=data.ramboot_addr;
+	        rambootMin=Number(data.ramboot_min_addr);
+	        rambootEnd=Number(data.ramboot_end);
+	      }
 	    }
 	    if(data&&data.nand_backup){
 	      var backupSize=data.nand_backup_bytes||0;
